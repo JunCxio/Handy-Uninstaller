@@ -54,6 +54,7 @@ const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
 const ID_SEARCH: usize = 101;
 const ID_REFRESH: usize = 102;
 const ID_UNINSTALL: usize = 103;
+const ID_VIEW: usize = 104;
 const MENU_UNINSTALL: u32 = 201;
 const MENU_FORCE_REMOVE: u32 = 202;
 const MENU_REMOVE_ENTRY: u32 = 203;
@@ -294,6 +295,10 @@ fn inventory() -> (Vec<Entry>, Vec<String>) {
     (entries, errors)
 }
 
+fn in_view(package: &str, store_view: bool) -> bool {
+    package.is_empty() != store_view
+}
+
 fn expand_env(text: &str) -> String {
     let input = wide(text);
     let needed = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), null_mut(), 0) };
@@ -488,6 +493,10 @@ mod tests {
         assert!(!include("系统组件", "uninstall.exe", true, ""));
         assert!(!include("子项目", "uninstall.exe", false, "父应用"));
         assert!(!include("无命令", "", false, ""));
+        assert!(in_view("", false));
+        assert!(!in_view("package", false));
+        assert!(!in_view("", true));
+        assert!(in_view("package", true));
     }
     #[test] fn command_and_icon() {
         assert_eq!(split_command("\"C:\\Program Files\\Demo\\uninstall.exe\" /quiet").unwrap(),
@@ -568,8 +577,9 @@ fn icon_for(entry: &Entry) -> Handle {
 }
 
 struct AppState {
-    window: Hwnd, label: Hwnd, search: Hwnd, refresh: Hwnd, uninstall: Hwnd, list: Hwnd, status: Hwnd,
-    images: Handle, entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
+    window: Hwnd, label: Hwnd, search: Hwnd, refresh: Hwnd, view: Hwnd,
+    uninstall: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
+    entries: Vec<Entry>, visible: Vec<usize>, store_view: bool, loading: bool, rendering: bool,
 }
 
 impl AppState {
@@ -579,13 +589,14 @@ impl AppState {
         let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL,
             WS_EX_CLIENTEDGE, ID_SEARCH);
         let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP, 0, ID_REFRESH);
+        let view = create_control(instance, window, "BUTTON", "查看商店应用", basic | WS_TABSTOP, 0, ID_VIEW);
         let uninstall = create_control(instance, window, "BUTTON", "卸载所选应用", basic | WS_TABSTOP,
             0, ID_UNINSTALL);
         let list = create_control(instance, window, "SysListView32", "",
             basic | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE, 0);
         let status = create_control(instance, window, "STATIC", "正在读取应用列表…", basic, 0, 0);
         let font = unsafe { GetStockObject(17) };
-        for control in [label, search, refresh, uninstall, list, status] {
+        for control in [label, search, refresh, view, uninstall, list, status] {
             unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1); }
         }
         unsafe {
@@ -598,8 +609,8 @@ impl AppState {
         add_column(list, 3, "来源", 230);
         let images = unsafe { ImageList_Create(16, 16, 0x21, 8, 16) };
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
-        let state = Self { window, label, search, refresh, uninstall, list, status, images,
-            entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false };
+        let state = Self { window, label, search, refresh, view, uninstall, list, status, images,
+            entries: Vec::new(), visible: Vec::new(), store_view: false, loading: false, rendering: false };
         state.layout();
         state
     }
@@ -613,6 +624,7 @@ impl AppState {
             MoveWindow(self.label, 12, 15, 65, 20, 1);
             MoveWindow(self.search, 80, 10, 290, 26, 1);
             MoveWindow(self.refresh, 385, 9, 70, 28, 1);
+            MoveWindow(self.view, 465, 9, 120, 28, 1);
             MoveWindow(self.uninstall, width - 157, 9, 145, 28, 1);
             MoveWindow(self.list, 12, 50, width - 24, height - 80, 1);
             MoveWindow(self.status, 12, height - 25, width - 24, 20, 1);
@@ -624,7 +636,7 @@ impl AppState {
     fn refresh(&mut self) {
         if self.loading { return; }
         self.loading = true;
-        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.uninstall, 0); }
+        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.view, 0); EnableWindow(self.uninstall, 0); }
         self.set_status("正在读取应用列表…");
         let window = self.window;
         thread::spawn(move || {
@@ -649,7 +661,7 @@ impl AppState {
         }
         self.entries = entries;
         self.loading = false;
-        unsafe { EnableWindow(self.refresh, 1); }
+        unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.view, 1); }
         self.rendering = false;
         self.render();
         if !errors.is_empty() { message(self.window, "部分来源读取失败", &errors.join("\n"), 0x30); }
@@ -662,6 +674,14 @@ impl AppState {
 
     fn update_selection(&self) {
         unsafe { EnableWindow(self.uninstall, (!self.loading && self.selected().is_some()) as i32); }
+    }
+
+    fn switch_view(&mut self) {
+        if self.loading { return; }
+        self.store_view = !self.store_view;
+        let label = if self.store_view { "查看桌面应用" } else { "查看商店应用" };
+        unsafe { SetWindowTextW(self.view, wide(label).as_ptr()); }
+        self.render();
     }
 
     fn context_menu(&mut self, mut point: Point, keyboard: bool) {
@@ -827,6 +847,7 @@ impl AppState {
         unsafe { SendMessageW(self.list, LVM_DELETEALLITEMS, 0, 0); }
         self.visible.clear();
         for (index, entry) in self.entries.iter().enumerate() {
+            if !in_view(&entry.package, self.store_view) { continue; }
             if !query.is_empty() && !entry.name.to_lowercase().contains(&query)
                 && !entry.publisher.to_lowercase().contains(&query)
                 && !entry.version.to_lowercase().contains(&query) { continue; }
@@ -848,7 +869,8 @@ impl AppState {
         }
         self.rendering = false;
         self.update_selection();
-        self.set_status(&format!("已读取 {} 个可卸载应用", self.entries.len()));
+        let kind = if self.store_view { "商店应用" } else { "桌面应用" };
+        self.set_status(&format!("已显示 {} 个{kind}", self.visible.len()));
     }
 
     fn uninstall_selected(&mut self) {
@@ -915,6 +937,7 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
             match (id, notification) {
                 (ID_SEARCH, 0x300) => (*pointer).render(),
                 (ID_REFRESH, 0) => (*pointer).refresh(),
+                (ID_VIEW, 0) => (*pointer).switch_view(),
                 (ID_UNINSTALL, 0) => (*pointer).uninstall_selected(),
                 _ => return DefWindowProcW(window, message_id, wparam, lparam),
             }
@@ -947,7 +970,7 @@ fn main() {
         let instance = GetModuleHandleW(null());
         let class_name = wide("HandyUninstallerWindow");
         let class = WndClass { style: 0, proc: Some(window_proc), class_extra: 0, window_extra: 0,
-            instance, icon: LoadIconW(0, 32512usize as *const u16),
+            instance, icon: LoadIconW(instance, 1usize as *const u16),
             cursor: LoadCursorW(0, 32512usize as *const u16), background: 6,
             menu_name: null(), class_name: class_name.as_ptr() };
         if RegisterClassW(&class) == 0 { return; }

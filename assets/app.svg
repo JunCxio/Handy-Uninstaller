@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Handy Uninstaller 图标">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2C83F7"/>
+      <stop offset="0.55" stop-color="#1764D8"/>
+      <stop offset="1" stop-color="#123DA7"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF7469"/>
+      <stop offset="1" stop-color="#E6444D"/>
+    </linearGradient>
+    <filter id="window-shadow" x="-25%" y="-25%" width="150%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#0A2F80" flood-opacity="0.28"/>
+    </filter>
+    <filter id="badge-shadow" x="-35%" y="-35%" width="170%" height="170%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#0A2F80" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="url(#background)"/>
+  <path d="M64 14h127c27 0 51 21 55 47-44 17-91 23-136 18-35-4-64-15-91-31 9-20 26-34 45-34Z" fill="#FFFFFF" opacity="0.08"/>
+  <rect x="9.5" y="9.5" width="237" height="237" rx="54.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.15"/>
+
+  <g filter="url(#window-shadow)">
+    <rect x="50" y="50" width="154" height="154" rx="22" fill="#FFFFFF"/>
+  </g>
+  <path d="M72 50h110c12 0 22 10 22 22v22H50V72c0-12 10-22 22-22Z" fill="#EAF3FF"/>
+  <circle cx="72" cy="72" r="4" fill="#8AB5EA"/>
+  <circle cx="86" cy="72" r="4" fill="#8AB5EA"/>
+  <circle cx="100" cy="72" r="4" fill="#8AB5EA"/>
+
+  <rect x="71" y="110" width="42" height="42" rx="9" fill="#2775E4"/>
+  <rect x="123" y="110" width="42" height="42" rx="9" fill="#B6D7FA"/>
+  <rect x="71" y="162" width="42" height="24" rx="8" fill="#B6D7FA"/>
+
+  <g filter="url(#badge-shadow)">
+    <circle cx="177" cy="177" r="39" fill="url(#badge)" stroke="#FFFFFF" stroke-width="6"/>
+  </g>
+  <path d="M158 177h38" stroke="#FFFFFF" stroke-width="13" stroke-linecap="round"/>
+</svg>
