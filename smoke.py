@@ -12,10 +12,18 @@ from pathlib import Path
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
 user32.FindWindowW.restype = ctypes.c_void_p
+user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+enum_callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_ssize_t)
+user32.EnumWindows.argtypes = [enum_callback, ctypes.c_ssize_t]
 user32.FindWindowExW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p]
 user32.FindWindowExW.restype = ctypes.c_void_p
 user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
 user32.SendMessageW.restype = ctypes.c_ssize_t
+user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
 user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.GetMenuItemCount.argtypes = [ctypes.c_void_p]
@@ -88,7 +96,17 @@ process = subprocess.Popen([str(exe)])
 try:
     window = None
     for _ in range(100):
-        window = user32.FindWindowW("HandyUninstallerWindow", None)
+        def match(candidate, _):
+            global window
+            pid = ctypes.c_uint32()
+            user32.GetWindowThreadProcessId(candidate, ctypes.byref(pid))
+            class_name = ctypes.create_unicode_buffer(100)
+            user32.GetClassNameW(candidate, class_name, len(class_name))
+            if pid.value == process.pid and class_name.value == "HandyUninstallerWindow":
+                window = candidate
+                return False
+            return True
+        user32.EnumWindows(enum_callback(match), 0)
         if window:
             break
         time.sleep(0.1)
@@ -106,6 +124,16 @@ try:
             break
         time.sleep(0.1)
     assert count > 0, "应用列表为空"
+    header = user32.SendMessageW(listing, 0x101F, 0, 0)
+    assert header and user32.SendMessageW(header, 0x1200, 0, 0) == 6, "时间列缺失"
+    label = user32.FindWindowExW(window, None, "Static", None)
+    status = user32.FindWindowExW(window, label, "Static", None)
+    assert status, "状态栏缺失"
+    user32.SendMessageW(header, 0x0201, 1, 10 | (10 << 16))
+    user32.SendMessageW(header, 0x0202, 0, 10 | (10 << 16))
+    status_text = ctypes.create_unicode_buffer(200)
+    user32.GetWindowTextW(status, status_text, len(status_text))
+    assert "应用名称降序" in status_text.value, "点击列标题没有切换排序"
     images = user32.SendMessageW(listing, 0x1002, 1, 0)
     assert images, "图标列表未建立"
     save_window(window, Path(__file__).with_name("preview.png"))
@@ -141,8 +169,14 @@ try:
                ("卸载", "强制删除", "删除条目", "注册表条目", "安装文件夹")), labels
     assert not any("谷歌" in label for label in labels), labels
     user32.PostMessageW(menu_window, 0x0100, 27, 0)
+    if len(sys.argv) > 2:
+        time.sleep(float(sys.argv[2]))
     print(f"窗口正常，桌面应用 {count} 项；页签、搜索和五项右键菜单通过；未执行卸载或删除。")
 finally:
     if window:
         user32.PostMessageW(window, 0x0010, 0, 0)
-    process.wait(timeout=10)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        process.wait(timeout=10)

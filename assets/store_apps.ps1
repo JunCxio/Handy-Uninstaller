@@ -34,5 +34,5 @@ Get-AppxPackage |
             $icon = Find-Logo $package.InstallLocation $logo
             if ($icon) { break }
         }
-        @($package.Name, $package.PackageFullName, $package.Version.ToString(), $package.InstallLocation, $icon) -join "`t"
+        @($package.Name, $package.PackageFullName, $package.Version.ToString(), $package.InstallLocation, $icon, $package.PackageFamilyName) -join "`t"
     }

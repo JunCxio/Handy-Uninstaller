@@ -1,9 +1,11 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::mem::{size_of, transmute, zeroed};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -42,6 +44,8 @@ const WM_NOTIFY: u32 = 0x004e;
 const WM_CONTEXTMENU: u32 = 0x007b;
 const WM_SETFONT: u32 = 0x0030;
 const WM_APP_LOADED: u32 = 0x8001;
+const WM_APP_UNINSTALLED: u32 = 0x8002;
+const WM_TIMER: u32 = 0x0113;
 const TCM_GETCURSEL: u32 = 0x130b;
 const TCM_INSERTITEMW: u32 = 0x133e;
 const TCN_SELCHANGE: i32 = -551;
@@ -55,6 +59,8 @@ const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
 const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
 const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
+const LVN_COLUMNCLICK: i32 = -108;
+const USAGE_TIMER: usize = 1;
 const ID_SEARCH: usize = 101;
 const ID_REFRESH: usize = 102;
 const ID_TABS: usize = 104;
@@ -105,6 +111,13 @@ struct TabItem {
 #[repr(C)]
 struct NmHdr { hwnd: Hwnd, id: usize, code: i32 }
 #[repr(C)]
+struct NmListView { header: NmHdr, item: i32, subitem: i32 }
+#[repr(C)]
+struct ProcessEntry {
+    size: u32, usage: u32, id: u32, heap: usize, module: u32, threads: u32,
+    parent: u32, priority: i32, flags: u32, exe: [u16; 260],
+}
+#[repr(C)]
 struct LvHitTest { point: Point, flags: u32, item: i32, subitem: i32, group: i32 }
 
 #[link(name = "advapi32")]
@@ -129,6 +142,13 @@ extern "system" {
     fn LoadLibraryW(name: *const u16) -> Handle;
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     fn FreeLibrary(module: Handle) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> Handle;
+    fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
+    fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, process: u32) -> Handle;
+    fn QueryFullProcessImageNameW(process: Handle, flags: u32, path: *mut u16, size: *mut u32) -> i32;
+    fn CloseHandle(handle: Handle) -> i32;
+    fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
 }
 #[link(name = "user32")]
 extern "system" {
@@ -162,6 +182,8 @@ extern "system" {
     fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
     fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
     fn DestroyIcon(icon: Handle) -> i32;
+    fn SetTimer(window: Hwnd, id: usize, interval: u32, callback: *const c_void) -> usize;
+    fn KillTimer(window: Hwnd, id: usize) -> i32;
 }
 #[link(name = "gdi32")]
 extern "system" { fn GetStockObject(index: i32) -> Handle; }
@@ -226,6 +248,9 @@ impl Drop for GdiPlus {
 }
 
 fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() }
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
 fn from_wide(text: &[u16]) -> String {
     String::from_utf16_lossy(&text[..text.iter().position(|&ch| ch == 0).unwrap_or(text.len())])
 }
@@ -267,8 +292,22 @@ fn is_one(key: Hkey, name: &str) -> bool {
 #[derive(Clone)]
 struct Entry {
     name: String, version: String, publisher: String, source: String,
-    command: String, subkey: String, package: String, display_icon: String, install_location: String,
-    machine: bool, view: u32, msi: bool, image: i32,
+    command: String, subkey: String, package: String, package_family: String,
+    display_icon: String, install_location: String,
+    install_date: String, machine: bool, view: u32, msi: bool, image: i32,
+}
+
+fn install_date(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() != 8 || !bytes.iter().all(u8::is_ascii_digit) { return String::new(); }
+    let year = text[..4].parse::<u16>().unwrap();
+    let month = text[4..6].parse::<u8>().unwrap();
+    let day = text[6..8].parse::<u8>().unwrap();
+    if year == 0 || !(1..=12).contains(&month) { return String::new(); }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if day == 0 || day > days[month as usize - 1] { return String::new(); }
+    format!("{}-{}-{}", &text[..4], &text[4..6], &text[6..])
 }
 
 fn include(name: &str, command: &str, system: bool, parent: &str) -> bool {
@@ -303,9 +342,10 @@ fn registry_apps(errors: &mut Vec<String>) -> Vec<Entry> {
                 entries.push(Entry {
                     name: display_name, version: text_value(key.0, "DisplayVersion").trim().to_owned(),
                     publisher: text_value(key.0, "Publisher").trim().to_owned(), source: source.clone(),
-                    command, subkey, package: String::new(),
+                    command, subkey, package: String::new(), package_family: String::new(),
                     display_icon: text_value(key.0, "DisplayIcon").trim().to_owned(),
                     install_location: text_value(key.0, "InstallLocation").trim().to_owned(),
+                    install_date: install_date(text_value(key.0, "InstallDate").trim()),
                     machine, view, msi: is_one(key.0, "WindowsInstaller"), image: 0,
                 });
             }
@@ -342,13 +382,13 @@ fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
     }
     String::from_utf8_lossy(&bytes).lines().filter_map(|line| {
         let mut fields = line.split('\t');
-        let (name, package, version, location, icon) =
-            (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
-        if name.is_empty() || package.is_empty() || fields.next().is_some() { return None; }
+        let (name, package, version, location, icon, family) =
+            (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+        if name.is_empty() || package.is_empty() || family.is_empty() || fields.next().is_some() { return None; }
         Some(Entry { name: name.into(), version: version.into(), publisher: String::new(),
             source: "商店应用 · 当前用户".into(), command: String::new(), subkey: String::new(),
-            package: package.into(), display_icon: icon.into(), install_location: location.into(),
-            machine: false, view: 0, msi: false, image: 0 })
+            package: package.into(), package_family: family.into(), display_icon: icon.into(), install_location: location.into(),
+            install_date: String::new(), machine: false, view: 0, msi: false, image: 0 })
     }).collect()
 }
 
@@ -362,6 +402,141 @@ fn inventory() -> (Vec<Entry>, Vec<String>) {
 
 fn in_view(package: &str, store_view: bool) -> bool {
     package.is_empty() != store_view
+}
+
+fn entry_order(a: &Entry, b: &Entry, column: usize, descending: bool) -> std::cmp::Ordering {
+    let left = match column {
+        1 => &a.version, 2 => &a.publisher, 3 => &a.source, 4 => &a.install_date,
+        _ => &a.name,
+    };
+    let right = match column {
+        1 => &b.version, 2 => &b.publisher, 3 => &b.source, 4 => &b.install_date,
+        _ => &b.name,
+    };
+    let order = match (left.is_empty(), right.is_empty()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => {
+            let order = left.to_lowercase().cmp(&right.to_lowercase());
+            if descending { order.reverse() } else { order }
+        }
+    };
+    order.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+}
+
+fn usage_key(entry: &Entry) -> String {
+    let identity = if entry.package.is_empty() {
+        format!("R:{}:{}:{}", entry.machine, entry.view, entry.subkey.to_lowercase())
+    } else { format!("P:{}", entry.package_family.to_lowercase()) };
+    let mut key = String::with_capacity(identity.len() * 2);
+    for byte in identity.bytes() { write!(&mut key, "{byte:02x}").unwrap(); }
+    key
+}
+
+fn usage_text(seconds: Option<u64>) -> String {
+    match seconds {
+        Some(seconds) => format!("{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60),
+        None => "未记录".into(),
+    }
+}
+
+fn usage_order(a: Option<u64>, b: Option<u64>, descending: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(a), Some(b)) if descending => b.cmp(&a),
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn usage_file() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Handy Uninstaller").join("usage.tsv"))
+}
+
+fn load_usage(path: &Path) -> HashMap<String, u64> {
+    std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|line| {
+        let (key, value) = line.split_once('\t')?;
+        if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+        Some((key.to_owned(), value.parse().ok()?))
+    }).collect()
+}
+
+fn save_usage(path: &Path, usage: &HashMap<String, u64>) -> Result<(), String> {
+    std::fs::create_dir_all(path.parent().ok_or("使用时间保存路径无效")?)
+        .map_err(|error| error.to_string())?;
+    let mut data = String::new();
+    for (key, seconds) in usage { writeln!(&mut data, "{key}\t{seconds}").unwrap(); }
+    let temporary = path.with_extension("tsv.tmp");
+    std::fs::write(&temporary, data).map_err(|error| error.to_string())?;
+    if unsafe { MoveFileExW(wide_path(&temporary).as_ptr(), wide_path(path).as_ptr(), 0x9) } == 0 {
+        return Err(format!("无法替换使用时间记录：{}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn windows_path(path: &str) -> String {
+    path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+struct UsageTarget { key: String, folder: String, executable: String }
+
+fn usage_targets(entries: &[Entry]) -> Vec<UsageTarget> {
+    entries.iter().map(|entry| {
+        let folder = expand_env(entry.install_location.trim().trim_matches('"'));
+        let folder = if Path::new(&folder).is_absolute() && Path::new(&folder).components().count() >= 4 {
+            windows_path(&folder)
+        } else { String::new() };
+        let (icon, _) = parse_display_icon(&entry.display_icon);
+        let executable = if Path::new(&icon).is_absolute()
+            && Path::new(&icon).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
+            windows_path(&icon)
+        } else { String::new() };
+        UsageTarget { key: usage_key(entry), folder, executable }
+    }).collect()
+}
+
+fn matched_usage<'a>(path: &str, targets: &'a [UsageTarget]) -> Option<&'a str> {
+    let exact: Vec<_> = targets.iter().filter(|target| !target.executable.is_empty()
+        && target.executable == path).collect();
+    if exact.len() == 1 { return Some(&exact[0].key); }
+    if exact.len() > 1 { return None; }
+    let mut best: Option<&UsageTarget> = None;
+    let mut ambiguous = false;
+    for target in targets {
+        if target.folder.is_empty() || !path.starts_with(&target.folder)
+            || path.as_bytes().get(target.folder.len()) != Some(&b'\\') { continue; }
+        match best {
+            Some(current) if current.folder.len() > target.folder.len() => {}
+            Some(current) if current.folder.len() == target.folder.len() => { ambiguous = true; }
+            _ => { best = Some(target); ambiguous = false; }
+        }
+    }
+    if ambiguous { None } else { best.map(|target| target.key.as_str()) }
+}
+
+fn running_apps(targets: &[UsageTarget]) -> HashSet<String> {
+    let mut running = HashSet::new();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(2, 0) };
+    if snapshot == -1 { return running; }
+    let mut process: ProcessEntry = unsafe { zeroed() };
+    process.size = size_of::<ProcessEntry>() as u32;
+    let mut found = unsafe { Process32FirstW(snapshot, &mut process) };
+    while found != 0 {
+        let handle = unsafe { OpenProcess(0x1000, 0, process.id) };
+        if handle != 0 {
+            let mut path = [0u16; 32768];
+            let mut length = path.len() as u32;
+            if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut length) } != 0 {
+                let path = windows_path(&String::from_utf16_lossy(&path[..length as usize]));
+                if let Some(key) = matched_usage(&path, targets) { running.insert(key.to_owned()); }
+            }
+            unsafe { CloseHandle(handle); }
+        }
+        found = unsafe { Process32NextW(snapshot, &mut process) };
+    }
+    unsafe { CloseHandle(snapshot); }
+    running
 }
 
 fn expand_env(text: &str) -> String {
@@ -574,14 +749,53 @@ mod tests {
         assert_eq!(parse_display_icon("C:\\Apps\\Demo, Inc\\app.exe"),
             ("C:\\Apps\\Demo, Inc\\app.exe".into(), 0));
     }
+    #[test] fn date_and_sort() {
+        assert_eq!(install_date("20261015"), "2026-10-15");
+        assert!(install_date("20261340").is_empty());
+        assert!(install_date("20260229").is_empty());
+        assert_eq!(install_date("20240229"), "2024-02-29");
+        assert!(install_date("unknown").is_empty());
+        let basic = Entry { name: "B".into(), version: String::new(), publisher: String::new(),
+            source: String::new(), command: String::new(), subkey: String::new(),
+            package: String::new(), package_family: String::new(), display_icon: String::new(), install_location: String::new(),
+            install_date: "2026-01-01".into(), machine: false, view: 0, msi: false, image: 0 };
+        let newer = Entry { name: "A".into(), install_date: "2026-10-15".into(), ..basic.clone() };
+        let unknown = Entry { name: "C".into(), install_date: String::new(), ..basic.clone() };
+        assert!(entry_order(&newer, &basic, 4, false).is_gt());
+        assert!(entry_order(&newer, &basic, 4, true).is_lt());
+        assert!(entry_order(&unknown, &basic, 4, true).is_gt());
+        assert_eq!(usage_text(Some(3661)), "01:01:01");
+        assert!(usage_order(Some(5), Some(10), true).is_gt());
+        assert!(usage_order(None, Some(10), true).is_gt());
+    }
+    #[test] fn usage_matching_and_storage() {
+        let targets = vec![
+            UsageTarget { key: "one".into(), folder: "c:\\apps\\shared".into(),
+                executable: "c:\\apps\\shared\\one.exe".into() },
+            UsageTarget { key: "two".into(), folder: "c:\\apps\\shared".into(),
+                executable: "c:\\apps\\shared\\two.exe".into() },
+        ];
+        assert_eq!(matched_usage("c:\\apps\\shared\\one.exe", &targets), Some("one"));
+        assert_eq!(matched_usage("c:\\apps\\shared\\other.exe", &targets), None);
+        assert_eq!(matched_usage("c:\\apps\\sharedish\\one.exe", &targets), None);
+        let own_path = windows_path(&std::env::current_exe().unwrap().to_string_lossy());
+        assert!(running_apps(&[UsageTarget { key: "self".into(), folder: String::new(),
+            executable: own_path }]).contains("self"));
+        let path = std::env::current_dir().unwrap().join("target")
+            .join(format!("usage-check-{}.tsv", std::process::id()));
+        let usage = HashMap::from([("1234".into(), 3661)]);
+        save_usage(&path, &usage).unwrap();
+        assert_eq!(load_usage(&path), usage);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test] fn force_remove_rejects_shared_folder() {
         let folder = std::env::current_dir().unwrap().join("target")
             .join(format!("candidate-check-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let entry = Entry { name: "Demo".into(), version: String::new(), publisher: String::new(),
             source: String::new(), command: "uninstall.exe".into(), subkey: "demo".into(),
-            package: String::new(), display_icon: String::new(),
-            install_location: folder.to_string_lossy().into_owned(), machine: false, view: VIEW_64,
+            package: String::new(), package_family: String::new(), display_icon: String::new(),
+            install_location: folder.to_string_lossy().into_owned(), install_date: String::new(), machine: false, view: VIEW_64,
             msi: false, image: 0 };
         assert!(safe_directory(&folder, &entry, &[entry.clone()]).is_some());
         let other = Entry { subkey: "other".into(), ..entry.clone() };
@@ -664,6 +878,9 @@ struct AppState {
     window: Hwnd, label: Hwnd, search: Hwnd, refresh: Hwnd, tabs: Hwnd,
     list: Hwnd, status: Hwnd, images: Handle,
     entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
+    deleting: bool, uninstalling: bool, sort_column: usize, sort_descending: bool,
+    usage: HashMap<String, u64>, usage_targets: Vec<UsageTarget>, running: HashSet<String>,
+    last_sample: Instant, usage_save_error: bool,
 }
 
 impl AppState {
@@ -684,14 +901,20 @@ impl AppState {
         add_tab(tabs, 0, "桌面应用");
         add_tab(tabs, 1, "商店应用");
         unsafe { SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x10020); }
-        add_column(list, 0, "应用名称", 360);
-        add_column(list, 1, "版本", 125);
-        add_column(list, 2, "发布者", 225);
-        add_column(list, 3, "来源", 230);
+        add_column(list, 0, "应用名称", 300);
+        add_column(list, 1, "版本", 95);
+        add_column(list, 2, "发布者", 180);
+        add_column(list, 3, "来源", 150);
+        add_column(list, 4, "安装时间", 110);
+        add_column(list, 5, "使用时间", 105);
         let images = unsafe { ImageList_Create(16, 16, 0x21, 8, 16) };
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
         let state = Self { window, label, search, refresh, tabs, list, status, images,
-            entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false };
+            entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false,
+            deleting: false, uninstalling: false, sort_column: 0, sort_descending: false,
+            usage: usage_file().map(|path| load_usage(&path)).unwrap_or_default(),
+            usage_targets: Vec::new(), running: HashSet::new(), last_sample: Instant::now(),
+            usage_save_error: false };
         state.layout();
         state
     }
@@ -728,6 +951,7 @@ impl AppState {
     }
 
     fn loaded(&mut self, mut entries: Vec<Entry>, errors: Vec<String>) {
+        self.sample_usage(false);
         self.rendering = true;
         unsafe { ImageList_Remove(self.images, -1); }
         let generic = unsafe { LoadIconW(0, 32512usize as *const u16) };
@@ -741,6 +965,10 @@ impl AppState {
             if index >= 0 { entry.image = index; }
         }
         self.entries = entries;
+        self.visible.clear();
+        self.usage_targets = usage_targets(&self.entries);
+        self.running = running_apps(&self.usage_targets);
+        self.last_sample = Instant::now();
         self.loading = false;
         unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.tabs, 1); }
         self.rendering = false;
@@ -751,6 +979,28 @@ impl AppState {
     fn selected(&self) -> Option<usize> {
         let row = unsafe { SendMessageW(self.list, LVM_GETNEXTITEM, usize::MAX, 2) };
         if row < 0 { None } else { self.visible.get(row as usize).copied() }
+    }
+
+    fn sample_usage(&mut self, update_view: bool) {
+        if self.usage_targets.is_empty() { return; }
+        let now = Instant::now();
+        let seconds = now.duration_since(self.last_sample).as_secs();
+        if seconds > 0 {
+            for key in &self.running { *self.usage.entry(key.clone()).or_default() += seconds; }
+        }
+        self.running = running_apps(&self.usage_targets);
+        self.last_sample = now;
+        for key in &self.running { self.usage.entry(key.clone()).or_default(); }
+        if seconds == 0 { return; }
+        if let Some(path) = usage_file() {
+            if let Err(error) = save_usage(&path, &self.usage) {
+                if update_view && !self.usage_save_error {
+                    self.usage_save_error = true;
+                    message(self.window, "使用时间保存失败", &error, 0x30);
+                }
+            }
+        }
+        if update_view { self.render(); }
     }
 
     fn context_menu(&mut self, mut point: Point, keyboard: bool) {
@@ -775,18 +1025,25 @@ impl AppState {
         let menu = unsafe { CreatePopupMenu() };
         if menu == 0 { return; }
         unsafe {
-            AppendMenuW(menu, 0, MENU_UNINSTALL as usize, wide("卸载(&U)...").as_ptr());
-            AppendMenuW(menu, (!registry) as u32, MENU_FORCE_REMOVE as usize, wide("强制删除(&F)...").as_ptr());
-            AppendMenuW(menu, (!registry) as u32, MENU_REMOVE_ENTRY as usize, wide("删除条目(&E)...").as_ptr());
+            let busy = self.deleting || self.uninstalling;
+            AppendMenuW(menu, busy as u32, MENU_UNINSTALL as usize, wide("卸载(&U)...").as_ptr());
+            AppendMenuW(menu, (busy || !registry) as u32, MENU_FORCE_REMOVE as usize, wide("强制删除(&F)...").as_ptr());
+            AppendMenuW(menu, (busy || !registry) as u32, MENU_REMOVE_ENTRY as usize, wide("删除条目(&E)...").as_ptr());
             AppendMenuW(menu, 0x800, 0, null());
             AppendMenuW(menu, (!registry) as u32, MENU_REGISTRY as usize, wide("注册表条目(&R)").as_ptr());
             AppendMenuW(menu, (!folder) as u32, MENU_FOLDER as usize, wide("安装文件夹(&I)").as_ptr());
             let action = TrackPopupMenu(menu, 0x102, point.x, point.y, 0, self.window, null());
             DestroyMenu(menu);
             match action as u32 {
-                MENU_UNINSTALL => self.uninstall_selected(),
-                MENU_FORCE_REMOVE => self.force_remove(),
-                MENU_REMOVE_ENTRY => self.remove_entry(),
+                MENU_UNINSTALL | MENU_FORCE_REMOVE | MENU_REMOVE_ENTRY if !busy => {
+                    self.deleting = true;
+                    match action as u32 {
+                        MENU_UNINSTALL => self.uninstall_selected(),
+                        MENU_FORCE_REMOVE => self.force_remove(),
+                        _ => self.remove_entry(),
+                    }
+                    self.deleting = false;
+                }
                 MENU_REGISTRY => self.open_registry(),
                 MENU_FOLDER => self.open_folder(),
                 _ => {}
@@ -912,16 +1169,28 @@ impl AppState {
 
     fn render(&mut self) {
         self.rendering = true;
+        let selected = self.selected();
         let store_view = unsafe { SendMessageW(self.tabs, TCM_GETCURSEL, 0, 0) == 1 };
         let query = window_text(self.search).trim().to_lowercase();
         unsafe { SendMessageW(self.list, LVM_DELETEALLITEMS, 0, 0); }
-        self.visible.clear();
-        for (index, entry) in self.entries.iter().enumerate() {
-            if !in_view(&entry.package, store_view) { continue; }
-            if !query.is_empty() && !entry.name.to_lowercase().contains(&query)
-                && !entry.publisher.to_lowercase().contains(&query)
-                && !entry.version.to_lowercase().contains(&query) { continue; }
-            let row = self.visible.len() as i32;
+        self.visible = self.entries.iter().enumerate().filter(|(_, entry)| {
+            in_view(&entry.package, store_view) && (query.is_empty()
+                || entry.name.to_lowercase().contains(&query)
+                || entry.publisher.to_lowercase().contains(&query)
+                || entry.version.to_lowercase().contains(&query))
+        }).map(|(index, _)| index).collect();
+        self.visible.sort_by(|&a, &b| {
+            if self.sort_column == 5 {
+                let order = usage_order(self.usage.get(&usage_key(&self.entries[a])).copied(),
+                    self.usage.get(&usage_key(&self.entries[b])).copied(), self.sort_descending);
+                order.then_with(|| entry_order(&self.entries[a], &self.entries[b], 0, false))
+            } else {
+                entry_order(&self.entries[a], &self.entries[b], self.sort_column, self.sort_descending)
+            }
+        });
+        for (row, &index) in self.visible.iter().enumerate() {
+            let entry = &self.entries[index];
+            let row = row as i32;
             let mut name = wide(&entry.name);
             let mut item: LvItem = unsafe { zeroed() };
             item.mask = 3;
@@ -929,17 +1198,27 @@ impl AppState {
             item.text = name.as_mut_ptr();
             item.image = entry.image;
             unsafe { SendMessageW(self.list, LVM_INSERTITEMW, 0, &item as *const _ as isize); }
-            for (column, text) in [&entry.version, &entry.publisher, &entry.source].iter().enumerate() {
+            let usage = usage_text(self.usage.get(&usage_key(entry)).copied());
+            for (column, text) in [&entry.version, &entry.publisher, &entry.source,
+                &entry.install_date, &usage].iter().enumerate() {
                 let mut value = wide(text);
                 item.subitem = column as i32 + 1;
                 item.text = value.as_mut_ptr();
                 unsafe { SendMessageW(self.list, LVM_SETITEMTEXTW, row as usize, &item as *const _ as isize); }
             }
-            self.visible.push(index);
+        }
+        if let Some(row) = selected.and_then(|index| self.visible.iter().position(|&item| item == index)) {
+            let mut state: LvItem = unsafe { zeroed() };
+            state.state = 3;
+            state.state_mask = 3;
+            unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, row, &state as *const _ as isize); }
         }
         self.rendering = false;
         let kind = if store_view { "商店应用" } else { "桌面应用" };
-        self.set_status(&format!("已显示 {} 个{kind}", self.visible.len()));
+        let column = ["应用名称", "版本", "发布者", "来源", "安装时间", "使用时间"][self.sort_column];
+        let direction = if self.sort_descending { "降序" } else { "升序" };
+        let busy = if self.uninstalling { "；卸载进行中，不能删除其他应用" } else { "" };
+        self.set_status(&format!("已显示 {} 个{kind}；按{column}{direction}排列{busy}", self.visible.len()));
     }
 
     fn uninstall_selected(&mut self) {
@@ -963,7 +1242,19 @@ impl AppState {
             match Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", &command])
                 .creation_flags(0x08000000).spawn() {
-                Ok(_) => self.set_status(&format!("已启动 {} 的卸载命令；完成后可刷新列表。", entry.name)),
+                Ok(mut child) => {
+                    self.uninstalling = true;
+                    self.set_status(&format!("正在卸载 {}；期间不能删除其他应用。", entry.name));
+                    let window = self.window;
+                    thread::spawn(move || {
+                        let result = child.wait().map(|status| status.success())
+                            .map_err(|error| error.to_string());
+                        let result = Box::into_raw(Box::new(result));
+                        if unsafe { PostMessageW(window, WM_APP_UNINSTALLED, 0, result as isize) } == 0 {
+                            unsafe { drop(Box::from_raw(result)); }
+                        }
+                    });
+                }
                 Err(error) => { message(self.window, "无法启动卸载程序", &error.to_string(), 0x10); }
             }
             return;
@@ -981,7 +1272,10 @@ impl AppState {
         if result <= 32 {
             message(self.window, "无法启动卸载程序", &format!("ShellExecute 错误代码：{result}"), 0x10);
         } else {
-            self.set_status(&format!("已启动 {} 的卸载命令；完成后可刷新列表。", entry.name));
+            message(self.window, "卸载进行中", &format!(
+                "已启动“{}”的卸载程序。请完成或取消卸载流程后，再点击确定。期间不能删除其他应用。",
+                entry.name), 0x40);
+            self.refresh();
         }
     }
 }
@@ -1011,9 +1305,19 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
             return 0;
         }
         WM_NOTIFY if !pointer.is_null() => {
-            if lparam != 0 && !(*pointer).rendering && (*(lparam as *const NmHdr)).hwnd == (*pointer).tabs
-                && (*(lparam as *const NmHdr)).code == TCN_SELCHANGE {
-                (*pointer).render();
+            if lparam != 0 && !(*pointer).rendering {
+                let header = &*(lparam as *const NmHdr);
+                if header.hwnd == (*pointer).tabs && header.code == TCN_SELCHANGE {
+                    (*pointer).render();
+                } else if header.hwnd == (*pointer).list && header.code == LVN_COLUMNCLICK {
+                    let column = (*(lparam as *const NmListView)).subitem as usize;
+                    if column <= 5 {
+                        let state = &mut *pointer;
+                        state.sort_descending = state.sort_column == column && !state.sort_descending;
+                        state.sort_column = column;
+                        state.render();
+                    }
+                }
             }
             return 0;
         }
@@ -1022,8 +1326,27 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
             if !pointer.is_null() { (*pointer).loaded(entries, errors); }
             return 0;
         }
+        WM_APP_UNINSTALLED => {
+            let result = *Box::from_raw(lparam as *mut Result<bool, String>);
+            if !pointer.is_null() {
+                (*pointer).uninstalling = false;
+                (*pointer).refresh();
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => { message(window, "卸载未完成", "商店应用卸载命令执行失败。", 0x30); }
+                    Err(error) => { message(window, "卸载未完成", &format!("商店应用卸载失败：{error}"), 0x30); }
+                }
+            }
+            return 0;
+        }
+        WM_TIMER if !pointer.is_null() && wparam == USAGE_TIMER => {
+            (*pointer).sample_usage(true);
+            return 0;
+        }
         WM_DESTROY => { PostQuitMessage(0); return 0; }
         WM_NCDESTROY if !pointer.is_null() => {
+            KillTimer(window, USAGE_TIMER);
+            (*pointer).sample_usage(false);
             SetWindowLongPtrW(window, -21, 0);
             drop(Box::from_raw(pointer));
         }
@@ -1050,6 +1373,8 @@ fn main() {
         ShowWindow(window, 5);
         UpdateWindow(window);
         (*state).refresh();
+        // shortcut: 仅在窗口运行时统计，全天累计需要独立的后台组件。
+        SetTimer(window, USAGE_TIMER, 10_000, null());
         let mut msg: Msg = zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
             TranslateMessage(&msg);
