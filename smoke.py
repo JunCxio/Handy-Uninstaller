@@ -124,11 +124,29 @@ try:
             break
         time.sleep(0.1)
     assert count > 0, "应用列表为空"
-    header = user32.SendMessageW(listing, 0x101F, 0, 0)
-    assert header and user32.SendMessageW(header, 0x1200, 0, 0) == 6, "时间列缺失"
-    label = user32.FindWindowExW(window, None, "Static", None)
-    status = user32.FindWindowExW(window, label, "Static", None)
+    status = None
+    child = None
+    while True:
+        child = user32.FindWindowExW(window, child, "Static", None)
+        if not child:
+            break
+        content = ctypes.create_unicode_buffer(200)
+        user32.GetWindowTextW(child, content, len(content))
+        if content.value.startswith("已显示"):
+            status = child
+            break
     assert status, "状态栏缺失"
+    monitor = user32.FindWindowExW(window, None, "Button", "开始安装监控")
+    assert monitor, "安装监控按钮缺失"
+    user32.SendMessageW(monitor, 0x00F5, 0, 0)
+    monitor_text = ctypes.create_unicode_buffer(100)
+    user32.GetWindowTextW(monitor, monitor_text, len(monitor_text))
+    assert monitor_text.value == "停止安装监控", "安装监控未启动"
+    user32.SendMessageW(monitor, 0x00F5, 0, 0)
+    user32.GetWindowTextW(monitor, monitor_text, len(monitor_text))
+    assert monitor_text.value == "开始安装监控", "安装监控未停止"
+    header = user32.SendMessageW(listing, 0x101F, 0, 0)
+    assert header and user32.SendMessageW(header, 0x1200, 0, 0) == 5, "安装时间列缺失"
     user32.SendMessageW(header, 0x0201, 1, 10 | (10 << 16))
     user32.SendMessageW(header, 0x0202, 0, 10 | (10 << 16))
     status_text = ctypes.create_unicode_buffer(200)
@@ -171,7 +189,7 @@ try:
     user32.PostMessageW(menu_window, 0x0100, 27, 0)
     if len(sys.argv) > 2:
         time.sleep(float(sys.argv[2]))
-    print(f"窗口正常，桌面应用 {count} 项；页签、搜索和五项右键菜单通过；未执行卸载或删除。")
+    print(f"窗口正常，桌面应用 {count} 项；页签、搜索和右键菜单通过；未执行卸载或删除。")
 finally:
     if window:
         user32.PostMessageW(window, 0x0010, 0, 0)
