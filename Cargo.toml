@@ -1,0 +1,8 @@
+[package]
+name = "handy-uninstaller"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "s"
+strip = true
