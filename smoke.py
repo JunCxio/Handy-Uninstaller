@@ -16,7 +16,6 @@ user32.FindWindowExW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wcha
 user32.FindWindowExW.restype = ctypes.c_void_p
 user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
 user32.SendMessageW.restype = ctypes.c_ssize_t
-user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
 user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.GetMenuItemCount.argtypes = [ctypes.c_void_p]
@@ -96,7 +95,11 @@ try:
     assert window, "窗口未出现"
     listing = user32.FindWindowExW(window, None, "SysListView32", None)
     search = user32.FindWindowExW(window, None, "Edit", None)
-    assert listing and search, "列表或搜索框缺失"
+    tabs = user32.FindWindowExW(window, None, "SysTabControl32", None)
+    assert listing and search and tabs, "列表、搜索框或页签缺失"
+    assert user32.SendMessageW(tabs, 0x1304, 0, 0) == 2, "应用页签数量不符"
+    assert user32.SendMessageW(tabs, 0x130B, 0, 0) == 0, "默认视图不是桌面应用"
+    assert not user32.FindWindowExW(window, None, "Button", "卸载所选应用"), "顶部卸载按钮仍存在"
     for _ in range(300):
         count = user32.SendMessageW(listing, 0x1004, 0, 0)
         if count > 0:
@@ -106,14 +109,6 @@ try:
     images = user32.SendMessageW(listing, 0x1002, 1, 0)
     assert images, "图标列表未建立"
     save_window(window, Path(__file__).with_name("preview.png"))
-    view = user32.FindWindowExW(window, None, "Button", "查看商店应用")
-    assert view, "商店应用视图入口缺失"
-    user32.SendMessageW(view, 0x00F5, 0, 0)
-    label = ctypes.create_unicode_buffer(32)
-    user32.GetWindowTextW(view, label, len(label))
-    assert label.value == "查看桌面应用", "未切换到商店应用视图"
-    user32.SendMessageW(view, 0x00F5, 0, 0)
-    assert user32.SendMessageW(listing, 0x1004, 0, 0) == count, "切回桌面应用后数量不符"
     for character in "7-Zip":
         user32.SendMessageW(search, 0x0102, ord(character), 0)
     time.sleep(0.1)
@@ -146,7 +141,7 @@ try:
                ("卸载", "强制删除", "删除条目", "注册表条目", "安装文件夹")), labels
     assert not any("谷歌" in label for label in labels), labels
     user32.PostMessageW(menu_window, 0x0100, 27, 0)
-    print(f"窗口正常，桌面应用 {count} 项；视图切换、搜索和五项右键菜单通过；未执行卸载或删除。")
+    print(f"窗口正常，桌面应用 {count} 项；页签、搜索和五项右键菜单通过；未执行卸载或删除。")
 finally:
     if window:
         user32.PostMessageW(window, 0x0010, 0, 0)

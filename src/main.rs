@@ -2,7 +2,8 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::io::Read;
+use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,6 +42,9 @@ const WM_NOTIFY: u32 = 0x004e;
 const WM_CONTEXTMENU: u32 = 0x007b;
 const WM_SETFONT: u32 = 0x0030;
 const WM_APP_LOADED: u32 = 0x8001;
+const TCM_GETCURSEL: u32 = 0x130b;
+const TCM_INSERTITEMW: u32 = 0x133e;
+const TCN_SELCHANGE: i32 = -551;
 const LVM_FIRST: u32 = 0x1000;
 const LVM_SETIMAGELIST: u32 = LVM_FIRST + 3;
 const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
@@ -53,8 +57,7 @@ const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
 const ID_SEARCH: usize = 101;
 const ID_REFRESH: usize = 102;
-const ID_UNINSTALL: usize = 103;
-const ID_VIEW: usize = 104;
+const ID_TABS: usize = 104;
 const MENU_UNINSTALL: u32 = 201;
 const MENU_FORCE_REMOVE: u32 = 202;
 const MENU_REMOVE_ENTRY: u32 = 203;
@@ -95,6 +98,11 @@ struct LvItem {
     group_id: i32, columns: u32, column_ptr: *mut u32, column_format: *mut i32, group: i32,
 }
 #[repr(C)]
+struct TabItem {
+    mask: u32, state: u32, state_mask: u32, text: *mut u16,
+    text_max: i32, image: i32, param: isize,
+}
+#[repr(C)]
 struct NmHdr { hwnd: Hwnd, id: usize, code: i32 }
 #[repr(C)]
 struct LvHitTest { point: Point, flags: u32, item: i32, subitem: i32, group: i32 }
@@ -118,6 +126,9 @@ extern "system" {
 extern "system" {
     fn GetModuleHandleW(name: *const u16) -> Handle;
     fn ExpandEnvironmentStringsW(source: *const u16, result: *mut u16, size: u32) -> u32;
+    fn LoadLibraryW(name: *const u16) -> Handle;
+    fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
+    fn FreeLibrary(module: Handle) -> i32;
 }
 #[link(name = "user32")]
 extern "system" {
@@ -167,6 +178,51 @@ extern "system" {
     fn ExtractIconExW(file: *const u16, index: i32, large: *mut Handle, small: *mut Handle, count: u32) -> u32;
     fn ShellExecuteW(window: Hwnd, verb: *const u16, file: *const u16,
         arguments: *const u16, directory: *const u16, show: i32) -> Handle;
+}
+#[repr(C)]
+struct GdiplusStartupInput {
+    version: u32, callback: *const c_void, suppress_background_thread: i32, suppress_external_codecs: i32,
+}
+struct GdiPlus {
+    module: Handle, token: usize,
+    create_bitmap: unsafe extern "system" fn(*const u16, *mut *mut c_void) -> i32,
+    create_icon: unsafe extern "system" fn(*mut c_void, *mut Handle) -> i32,
+    dispose_image: unsafe extern "system" fn(*mut c_void) -> i32,
+    shutdown: unsafe extern "system" fn(usize),
+}
+
+impl GdiPlus {
+    fn start() -> Option<Self> {
+        unsafe {
+            let module = LoadLibraryW(wide("gdiplus.dll").as_ptr());
+            if module == 0 { return None; }
+            let names = [b"GdiplusStartup\0".as_slice(), b"GdiplusShutdown\0",
+                b"GdipCreateBitmapFromFile\0", b"GdipCreateHICONFromBitmap\0", b"GdipDisposeImage\0"];
+            let functions = names.map(|name| GetProcAddress(module, name.as_ptr()));
+            if functions.iter().any(|function| function.is_null()) {
+                FreeLibrary(module);
+                return None;
+            }
+            let startup: unsafe extern "system" fn(*mut usize, *const GdiplusStartupInput, *mut c_void) -> i32 =
+                transmute(functions[0]);
+            let mut token = 0;
+            let input = GdiplusStartupInput { version: 1, callback: null(),
+                suppress_background_thread: 0, suppress_external_codecs: 0 };
+            if startup(&mut token, &input, null_mut()) != 0 {
+                FreeLibrary(module);
+                return None;
+            }
+            Some(Self { module, token, create_bitmap: transmute(functions[2]),
+                create_icon: transmute(functions[3]), dispose_image: transmute(functions[4]),
+                shutdown: transmute(functions[1]) })
+        }
+    }
+}
+
+impl Drop for GdiPlus {
+    fn drop(&mut self) {
+        unsafe { (self.shutdown)(self.token); FreeLibrary(self.module); }
+    }
 }
 
 fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() }
@@ -259,10 +315,16 @@ fn registry_apps(errors: &mut Vec<String>) -> Vec<Entry> {
 }
 
 fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
-    let script = "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-AppxPackage | Where-Object { -not $_.IsFramework -and -not $_.IsResourcePackage -and -not $_.NonRemovable } | ForEach-Object { $_.Name + [char]9 + $_.PackageFullName + [char]9 + $_.Version.ToString() + [char]9 + $_.InstallLocation }";
+    let script = include_str!("../assets/store_apps.ps1");
     let child = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(0x08000000).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
     let Ok(mut child) = child else { errors.push("商店应用读取失败：无法启动 PowerShell".into()); return Vec::new() };
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -271,18 +333,21 @@ fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
             _ => { let _ = child.kill(); errors.push("商店应用读取超时或失败".into()); break; }
         }
     }
-    let Ok(output) = child.wait_with_output() else { return Vec::new() };
-    if !output.status.success() {
-        errors.push(format!("商店应用读取失败：PowerShell 退出代码 {:?}", output.status.code()));
+    let status = child.wait();
+    let bytes = reader.join().unwrap_or_default();
+    let Ok(status) = status else { return Vec::new() };
+    if !status.success() {
+        errors.push(format!("商店应用读取失败：PowerShell 退出代码 {:?}", status.code()));
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| {
+    String::from_utf8_lossy(&bytes).lines().filter_map(|line| {
         let mut fields = line.split('\t');
-        let (name, package, version, location) = (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+        let (name, package, version, location, icon) =
+            (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
         if name.is_empty() || package.is_empty() || fields.next().is_some() { return None; }
         Some(Entry { name: name.into(), version: version.into(), publisher: String::new(),
             source: "商店应用 · 当前用户".into(), command: String::new(), subkey: String::new(),
-            package: package.into(), display_icon: String::new(), install_location: location.into(),
+            package: package.into(), display_icon: icon.into(), install_location: location.into(),
             machine: false, view: 0, msi: false, image: 0 })
     }).collect()
 }
@@ -558,8 +623,27 @@ fn add_column(list: Hwnd, index: usize, title: &str, width: i32) {
     unsafe { SendMessageW(list, LVM_INSERTCOLUMNW, index, &column as *const _ as isize); }
 }
 
-fn icon_for(entry: &Entry) -> Handle {
-    // shortcut: 商店应用缺少 DisplayIcon 时使用通用图标；需要原生图标时解析包清单。
+fn add_tab(tabs: Hwnd, index: usize, title: &str) {
+    let mut text = wide(title);
+    let mut item: TabItem = unsafe { zeroed() };
+    item.mask = 1;
+    item.text = text.as_mut_ptr();
+    unsafe { SendMessageW(tabs, TCM_INSERTITEMW, index, &item as *const _ as isize); }
+}
+
+fn icon_for(entry: &Entry, gdiplus: Option<&GdiPlus>) -> Handle {
+    if !entry.package.is_empty() {
+        let Some(gdiplus) = gdiplus else { return 0 };
+        if entry.display_icon.is_empty() { return 0; }
+        let mut bitmap = null_mut();
+        if unsafe { (gdiplus.create_bitmap)(wide(&entry.display_icon).as_ptr(), &mut bitmap) } != 0 {
+            return 0;
+        }
+        let mut icon = 0;
+        let status = unsafe { (gdiplus.create_icon)(bitmap, &mut icon) };
+        unsafe { (gdiplus.dispose_image)(bitmap); }
+        return if status == 0 { icon } else { 0 };
+    }
     let mut candidates = vec![parse_display_icon(&entry.display_icon)];
     if let Ok((file, _)) = split_command(&entry.command) { candidates.push((file, 0)); }
     for (path, index) in candidates {
@@ -577,9 +661,9 @@ fn icon_for(entry: &Entry) -> Handle {
 }
 
 struct AppState {
-    window: Hwnd, label: Hwnd, search: Hwnd, refresh: Hwnd, view: Hwnd,
-    uninstall: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
-    entries: Vec<Entry>, visible: Vec<usize>, store_view: bool, loading: bool, rendering: bool,
+    window: Hwnd, label: Hwnd, search: Hwnd, refresh: Hwnd, tabs: Hwnd,
+    list: Hwnd, status: Hwnd, images: Handle,
+    entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
 }
 
 impl AppState {
@@ -589,28 +673,25 @@ impl AppState {
         let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL,
             WS_EX_CLIENTEDGE, ID_SEARCH);
         let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP, 0, ID_REFRESH);
-        let view = create_control(instance, window, "BUTTON", "查看商店应用", basic | WS_TABSTOP, 0, ID_VIEW);
-        let uninstall = create_control(instance, window, "BUTTON", "卸载所选应用", basic | WS_TABSTOP,
-            0, ID_UNINSTALL);
+        let tabs = create_control(instance, window, "SysTabControl32", "", basic | WS_TABSTOP, 0, ID_TABS);
         let list = create_control(instance, window, "SysListView32", "",
             basic | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE, 0);
         let status = create_control(instance, window, "STATIC", "正在读取应用列表…", basic, 0, 0);
         let font = unsafe { GetStockObject(17) };
-        for control in [label, search, refresh, view, uninstall, list, status] {
+        for control in [label, search, refresh, tabs, list, status] {
             unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1); }
         }
-        unsafe {
-            SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x10020);
-            EnableWindow(uninstall, 0);
-        }
+        add_tab(tabs, 0, "桌面应用");
+        add_tab(tabs, 1, "商店应用");
+        unsafe { SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x10020); }
         add_column(list, 0, "应用名称", 360);
         add_column(list, 1, "版本", 125);
         add_column(list, 2, "发布者", 225);
         add_column(list, 3, "来源", 230);
         let images = unsafe { ImageList_Create(16, 16, 0x21, 8, 16) };
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
-        let state = Self { window, label, search, refresh, view, uninstall, list, status, images,
-            entries: Vec::new(), visible: Vec::new(), store_view: false, loading: false, rendering: false };
+        let state = Self { window, label, search, refresh, tabs, list, status, images,
+            entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false };
         state.layout();
         state
     }
@@ -624,9 +705,8 @@ impl AppState {
             MoveWindow(self.label, 12, 15, 65, 20, 1);
             MoveWindow(self.search, 80, 10, 290, 26, 1);
             MoveWindow(self.refresh, 385, 9, 70, 28, 1);
-            MoveWindow(self.view, 465, 9, 120, 28, 1);
-            MoveWindow(self.uninstall, width - 157, 9, 145, 28, 1);
-            MoveWindow(self.list, 12, 50, width - 24, height - 80, 1);
+            MoveWindow(self.tabs, 12, 46, width - 24, 30, 1);
+            MoveWindow(self.list, 12, 78, width - 24, height - 108, 1);
             MoveWindow(self.status, 12, height - 25, width - 24, 20, 1);
         }
     }
@@ -636,7 +716,7 @@ impl AppState {
     fn refresh(&mut self) {
         if self.loading { return; }
         self.loading = true;
-        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.view, 0); EnableWindow(self.uninstall, 0); }
+        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.tabs, 0); }
         self.set_status("正在读取应用列表…");
         let window = self.window;
         thread::spawn(move || {
@@ -652,8 +732,9 @@ impl AppState {
         unsafe { ImageList_Remove(self.images, -1); }
         let generic = unsafe { LoadIconW(0, 32512usize as *const u16) };
         unsafe { ImageList_ReplaceIcon(self.images, -1, generic); }
+        let gdiplus = GdiPlus::start();
         for entry in &mut entries {
-            let icon = icon_for(entry);
+            let icon = icon_for(entry, gdiplus.as_ref());
             if icon == 0 { continue; }
             let index = unsafe { ImageList_ReplaceIcon(self.images, -1, icon) };
             unsafe { DestroyIcon(icon); }
@@ -661,7 +742,7 @@ impl AppState {
         }
         self.entries = entries;
         self.loading = false;
-        unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.view, 1); }
+        unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.tabs, 1); }
         self.rendering = false;
         self.render();
         if !errors.is_empty() { message(self.window, "部分来源读取失败", &errors.join("\n"), 0x30); }
@@ -670,18 +751,6 @@ impl AppState {
     fn selected(&self) -> Option<usize> {
         let row = unsafe { SendMessageW(self.list, LVM_GETNEXTITEM, usize::MAX, 2) };
         if row < 0 { None } else { self.visible.get(row as usize).copied() }
-    }
-
-    fn update_selection(&self) {
-        unsafe { EnableWindow(self.uninstall, (!self.loading && self.selected().is_some()) as i32); }
-    }
-
-    fn switch_view(&mut self) {
-        if self.loading { return; }
-        self.store_view = !self.store_view;
-        let label = if self.store_view { "查看桌面应用" } else { "查看商店应用" };
-        unsafe { SetWindowTextW(self.view, wide(label).as_ptr()); }
-        self.render();
     }
 
     fn context_menu(&mut self, mut point: Point, keyboard: bool) {
@@ -843,11 +912,12 @@ impl AppState {
 
     fn render(&mut self) {
         self.rendering = true;
+        let store_view = unsafe { SendMessageW(self.tabs, TCM_GETCURSEL, 0, 0) == 1 };
         let query = window_text(self.search).trim().to_lowercase();
         unsafe { SendMessageW(self.list, LVM_DELETEALLITEMS, 0, 0); }
         self.visible.clear();
         for (index, entry) in self.entries.iter().enumerate() {
-            if !in_view(&entry.package, self.store_view) { continue; }
+            if !in_view(&entry.package, store_view) { continue; }
             if !query.is_empty() && !entry.name.to_lowercase().contains(&query)
                 && !entry.publisher.to_lowercase().contains(&query)
                 && !entry.version.to_lowercase().contains(&query) { continue; }
@@ -868,8 +938,7 @@ impl AppState {
             self.visible.push(index);
         }
         self.rendering = false;
-        self.update_selection();
-        let kind = if self.store_view { "商店应用" } else { "桌面应用" };
+        let kind = if store_view { "商店应用" } else { "桌面应用" };
         self.set_status(&format!("已显示 {} 个{kind}", self.visible.len()));
     }
 
@@ -937,15 +1006,14 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
             match (id, notification) {
                 (ID_SEARCH, 0x300) => (*pointer).render(),
                 (ID_REFRESH, 0) => (*pointer).refresh(),
-                (ID_VIEW, 0) => (*pointer).switch_view(),
-                (ID_UNINSTALL, 0) => (*pointer).uninstall_selected(),
                 _ => return DefWindowProcW(window, message_id, wparam, lparam),
             }
             return 0;
         }
         WM_NOTIFY if !pointer.is_null() => {
-            if lparam != 0 && !(*pointer).rendering && (*(lparam as *const NmHdr)).hwnd == (*pointer).list {
-                (*pointer).update_selection();
+            if lparam != 0 && !(*pointer).rendering && (*(lparam as *const NmHdr)).hwnd == (*pointer).tabs
+                && (*(lparam as *const NmHdr)).code == TCN_SELCHANGE {
+                (*pointer).render();
             }
             return 0;
         }
@@ -966,7 +1034,7 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
 
 fn main() {
     unsafe {
-        InitCommonControlsEx(&InitCommonControls { size: size_of::<InitCommonControls>() as u32, classes: 1 });
+        InitCommonControlsEx(&InitCommonControls { size: size_of::<InitCommonControls>() as u32, classes: 9 });
         let instance = GetModuleHandleW(null());
         let class_name = wide("HandyUninstallerWindow");
         let class = WndClass { style: 0, proc: Some(window_proc), class_extra: 0, window_extra: 0,
