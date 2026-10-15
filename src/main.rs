@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::io::Read;
 use std::mem::{size_of, transmute, zeroed};
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -157,6 +158,7 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleW(name: *const u16) -> Handle;
+    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
     fn ExpandEnvironmentStringsW(source: *const u16, result: *mut u16, size: u32) -> u32;
     fn LoadLibraryW(name: *const u16) -> Handle;
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
@@ -387,6 +389,15 @@ fn set_control_theme(window: Hwnd, dark: bool) {
 fn from_wide(text: &[u16]) -> String {
     String::from_utf16_lossy(&text[..text.iter().position(|&ch| ch == 0).unwrap_or(text.len())])
 }
+fn system_directory() -> Result<PathBuf, String> {
+    let mut buffer = vec![0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() { return Err("无法定位 Windows 系统目录".into()); }
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+fn powershell() -> Result<PathBuf, String> {
+    Ok(system_directory()?.join(r"WindowsPowerShell\v1.0\powershell.exe"))
+}
 fn hive(machine: bool) -> Hkey { (if machine { 0x80000002u32 } else { 0x80000001u32 }) as i32 as isize }
 
 struct Key(Hkey);
@@ -447,7 +458,7 @@ fn include(name: &str, command: &str, system: bool, parent: &str) -> bool {
     !name.trim().is_empty() && !command.trim().is_empty() && !system && parent.trim().is_empty()
 }
 
-fn registry_apps(errors: &mut Vec<String>) -> Vec<Entry> {
+fn registry_apps(errors: &mut Vec<String>, include_hidden: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
     for machine in [true, false] {
@@ -467,7 +478,7 @@ fn registry_apps(errors: &mut Vec<String>) -> Vec<Entry> {
                 let Some(key) = open_key(root.0, &subkey, view, KEY_READ) else { continue };
                 let display_name = text_value(key.0, "DisplayName").trim().to_owned();
                 let command = text_value(key.0, "UninstallString").trim().to_owned();
-                if !include(&display_name, &command, is_one(key.0, "SystemComponent"),
+                if !include_hidden && !include(&display_name, &command, is_one(key.0, "SystemComponent"),
                     &text_value(key.0, "ParentDisplayName")) { continue; }
                 let identity = format!("{}\0{}\0{}", if machine { "HKLM" } else { "HKCU" },
                     subkey.to_lowercase(), command.to_lowercase());
@@ -489,7 +500,8 @@ fn registry_apps(errors: &mut Vec<String>) -> Vec<Entry> {
 
 fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
     let script = include_str!("../assets/store_apps.ps1");
-    let child = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let Ok(powershell) = powershell() else { errors.push("商店应用读取失败：无法定位 PowerShell".into()); return Vec::new() };
+    let child = Command::new(powershell).args(["-NoProfile", "-NonInteractive", "-Command", script])
         .creation_flags(0x08000000).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
     let Ok(mut child) = child else { errors.push("商店应用读取失败：无法启动 PowerShell".into()); return Vec::new() };
     let mut stdout = child.stdout.take().unwrap();
@@ -529,16 +541,29 @@ fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
 
 fn inventory() -> (Vec<Entry>, Vec<String>) {
     let mut errors = Vec::new();
-    let mut entries = registry_apps(&mut errors);
+    let mut entries = registry_apps(&mut errors, false);
     entries.extend(store_apps(&mut errors));
     entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     (entries, errors)
+}
+
+fn cleanup_inventory(entry: &Entry) -> Result<Vec<Entry>, String> {
+    let mut errors = Vec::new();
+    let mut entries = registry_apps(&mut errors, true);
+    if !entry.package.is_empty() { entries.extend(store_apps(&mut errors)); }
+    if errors.is_empty() { Ok(entries) } else { Err(errors.join("\n")) }
 }
 
 fn entry_identity(entry: &Entry) -> String {
     if entry.package.is_empty() {
         format!("{}:{}:{}", entry.machine, entry.view, entry.subkey.to_lowercase())
     } else { entry.package.to_lowercase() }
+}
+
+fn same_name_elsewhere(entry: &Entry, entries: &[Entry]) -> bool {
+    let name = entry.name.to_lowercase();
+    entries.iter().any(|other| other.name.to_lowercase() == name
+        && entry_identity(other) != entry_identity(entry))
 }
 
 fn in_view(package: &str, store_view: bool) -> bool {
@@ -570,7 +595,8 @@ fn expand_env(text: &str) -> String {
     let needed = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), null_mut(), 0) };
     if needed == 0 { return text.into(); }
     let mut buffer = vec![0; needed as usize];
-    if unsafe { ExpandEnvironmentStringsW(input.as_ptr(), buffer.as_mut_ptr(), needed) } == 0 { return text.into(); }
+    let written = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), buffer.as_mut_ptr(), needed) };
+    if written == 0 || written >= needed { return text.into(); }
     from_wide(&buffer)
 }
 
@@ -599,6 +625,15 @@ fn split_command(command: &str) -> Result<(String, String), String> {
         .or_else(|| expanded.find(char::is_whitespace)).unwrap_or(expanded.len());
     if split == 0 { return Err("卸载命令没有可执行文件".into()); }
     Ok((expanded[..split].into(), expanded[split..].trim_start().into()))
+}
+
+fn uninstall_executable(file: &str) -> Result<String, String> {
+    let path = Path::new(file);
+    if path.is_absolute() { return Ok(file.to_owned()); }
+    if path.components().count() != 1 { return Err("卸载程序必须使用绝对路径".into()); }
+    let system = system_directory()?.join(file);
+    if !system.is_file() { return Err("无法在 Windows 系统目录找到卸载程序，请检查登记命令".into()); }
+    Ok(system.to_string_lossy().into_owned())
 }
 
 fn msi_command(command: &str) -> String {
@@ -664,7 +699,10 @@ impl RemovalTarget {
 
     fn delete(&self) -> Result<(), String> {
         match self {
-            Self::Directory(path) => std::fs::remove_dir_all(path).map_err(|error| error.to_string()),
+            Self::Directory(path) => {
+                ensure_no_reparse_points(path).map_err(|error| error.to_string())?;
+                std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+            }
             Self::Shortcut(path) => std::fs::remove_file(path).map_err(|error| error.to_string()),
             Self::Registry { machine, view, parent, name } => {
                 let key = open_key(hive(*machine), parent, *view, KEY_READ | KEY_WRITE | 0x10000)
@@ -686,27 +724,70 @@ fn single_key_component(name: &str) -> bool {
     !name.is_empty() && !name.contains(['\\', '/', '\0']) && name != "." && name != ".."
 }
 
+fn ensure_no_reparse_points(path: &Path) -> std::io::Result<()> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() { break; }
+        if std::fs::symlink_metadata(ancestor)?.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(format!("路径包含重解析点：{}", ancestor.display())));
+        }
+    }
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&next)?;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(format!("包含重解析点：{}", next.display())));
+        }
+        if metadata.is_dir() {
+            for child in std::fs::read_dir(&next)? { pending.push(child?.path()); }
+        }
+    }
+    Ok(())
+}
+
 fn safe_directory(path: &Path, entry: &Entry, entries: &[Entry]) -> Option<PathBuf> {
     if !path.is_absolute() { return None; }
+    for variable in ["WINDIR", "ProgramFiles", "ProgramData", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        if !std::env::var_os(variable).is_some_and(|root| Path::new(&root).is_absolute()) { return None; }
+    }
+    for component in path.ancestors() {
+        if component.as_os_str().is_empty() { break; }
+        if std::fs::symlink_metadata(component).ok()?.file_attributes() & 0x400 != 0 { return None; }
+    }
     let path = path.canonicalize().ok()?;
     if !path.is_dir() || path.components().count() < 3 { return None; }
+    let leaf = path.file_name()?.to_string_lossy();
+    if ["Microsoft", "Windows", "WindowsApps", "System32", "Common Files"]
+        .iter().any(|name| leaf.eq_ignore_ascii_case(name))
+        || (!entry.publisher.is_empty() && leaf.eq_ignore_ascii_case(&entry.publisher)) { return None; }
     for variable in ["WINDIR", "SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles",
         "CommonProgramFiles(x86)", "ProgramData", "PUBLIC", "USERPROFILE", "APPDATA",
         "LOCALAPPDATA", "TEMP", "TMP"] {
         if let Some(root) = std::env::var_os(variable).and_then(|value| PathBuf::from(value).canonicalize().ok()) {
-            if path == root || (matches!(variable, "WINDIR" | "SystemRoot") && path.starts_with(root)) { return None; }
+            if path == root || (matches!(variable, "WINDIR" | "SystemRoot" | "CommonProgramFiles" |
+                "CommonProgramFiles(x86)") && path.starts_with(&root)) { return None; }
         }
     }
     if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-        for name in ["Desktop", "Documents", "Downloads"] {
-            if home.join(name).canonicalize().ok().as_ref() == Some(&path) { return None; }
+        let candidate = PathBuf::from(display_path(&path).to_lowercase());
+        let home = PathBuf::from(home.to_string_lossy().to_lowercase());
+        if home.parent().is_some_and(|profiles| candidate.starts_with(profiles)) {
+            if !candidate.starts_with(&home) { return None; }
+            let in_app_data = ["APPDATA", "LOCALAPPDATA"].iter().any(|variable|
+                std::env::var_os(variable).and_then(|root| PathBuf::from(root).canonicalize().ok())
+                    .is_some_and(|root| candidate.starts_with(PathBuf::from(display_path(&root).to_lowercase()))));
+            if !in_app_data { return None; }
         }
+    }
+    for (variable, suffix) in [("ProgramData", "Microsoft"), ("APPDATA", "Microsoft"),
+        ("LOCALAPPDATA", "Microsoft")] {
+        if std::env::var_os(variable).and_then(|root| PathBuf::from(root).join(suffix).canonicalize().ok())
+            .is_some_and(|root| path.starts_with(root)) { return None; }
     }
     for other in entries {
         if let Some(other_path) = install_folder(other).and_then(|path| PathBuf::from(path).canonicalize().ok()) {
             let same_entry = other.machine == entry.machine && other.view == entry.view
                 && other.subkey == entry.subkey && other.package == entry.package;
-            if !same_entry && other_path.starts_with(&path) { return None; }
+            if !same_entry && (other_path.starts_with(&path) || path.starts_with(other_path)) { return None; }
         }
     }
     Some(path)
@@ -742,8 +823,8 @@ fn removal_candidates(entry: &Entry, entries: &[Entry]) -> Vec<RemovalTarget> {
         safe_directory(Path::new(&location), entry, entries));
     if let Some(folder) = &install {
         let script = "$ErrorActionPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; $s=New-Object -ComObject WScript.Shell; @([Environment]::GetFolderPath('Programs'),[Environment]::GetFolderPath('CommonPrograms'),[Environment]::GetFolderPath('DesktopDirectory'),[Environment]::GetFolderPath('CommonDesktopDirectory')) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter *.lnk -File -Recurse } | ForEach-Object { $_.FullName + [char]9 + $s.CreateShortcut($_.FullName).TargetPath }";
-        if let Ok(output) = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .creation_flags(0x08000000).output() {
+        if let Ok(output) = powershell().and_then(|path| Command::new(path).args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(0x08000000).output().map_err(|error| error.to_string())) {
             if output.status.success() {
                 let mut seen = HashSet::new();
                 for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -760,7 +841,8 @@ fn removal_candidates(entry: &Entry, entries: &[Entry]) -> Vec<RemovalTarget> {
     }
     if let Some(folder) = &install { candidates.push(RemovalTarget::Directory(folder.clone())); }
     let specific_name = single_key_component(&entry.name) && entry.name.chars().count() >= 4
-        && !entry.publisher.to_lowercase().contains(&entry.name.to_lowercase());
+        && !entry.publisher.to_lowercase().contains(&entry.name.to_lowercase())
+        && !same_name_elsewhere(entry, entries);
     if specific_name {
         for variable in ["APPDATA", "LOCALAPPDATA", "PROGRAMDATA"] {
             if let Some(root) = std::env::var_os(variable) {
@@ -773,8 +855,9 @@ fn removal_candidates(entry: &Entry, entries: &[Entry]) -> Vec<RemovalTarget> {
         for machine in [false, true] {
             for view in [VIEW_64, VIEW_32] {
                 if !machine && view == VIEW_32 { continue; }
-                for parent in ["SOFTWARE".to_owned(), format!("SOFTWARE\\{}", entry.publisher)] {
-                    if parent != "SOFTWARE" && !single_key_component(&entry.publisher) { continue; }
+                if single_key_component(&entry.publisher)
+                    && !entry.publisher.eq_ignore_ascii_case("Microsoft") {
+                    let parent = format!("SOFTWARE\\{}", entry.publisher);
                     let path = format!("{parent}\\{}", entry.name);
                     if open_key(hive(machine), &path, view, KEY_READ).is_some() {
                         candidates.push(RemovalTarget::Registry { machine, view,
@@ -807,6 +890,8 @@ mod tests {
             ("C:\\Program Files\\Demo\\uninstall.exe".into(), "/quiet".into()));
         assert_eq!(split_command("C:\\Program Files\\Demo\\uninstall.exe /quiet").unwrap().0,
             "C:\\Program Files\\Demo\\uninstall.exe");
+        assert!(uninstall_executable("MsiExec.exe").unwrap().to_lowercase().ends_with(r"\system32\msiexec.exe"));
+        assert!(uninstall_executable(r"tools\uninstall.exe").is_err());
         assert_eq!(msi_command("MsiExec.exe /I{12345678}"), "MsiExec.exe /X{12345678}");
         assert_eq!(parse_display_icon("\"C:\\Program Files\\Demo\\app.exe\",-12"),
             ("C:\\Program Files\\Demo\\app.exe".into(), -12));
@@ -836,8 +921,8 @@ mod tests {
         assert!(entry_order(&unknown, &basic, 4, true).is_gt());
     }
     #[test] fn force_remove_rejects_shared_folder() {
-        let folder = std::env::current_dir().unwrap().join("target")
-            .join(format!("candidate-check-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("handy-candidate-check-{}", std::process::id()));
+        let folder = root.join("Demo");
         std::fs::create_dir_all(&folder).unwrap();
         let entry = Entry { name: "Demo".into(), version: String::new(), publisher: String::new(),
             source: String::new(), command: "uninstall.exe".into(), subkey: "demo".into(),
@@ -847,10 +932,26 @@ mod tests {
         assert!(safe_directory(&folder, &entry, &[entry.clone()]).is_some());
         let other = Entry { subkey: "other".into(), ..entry.clone() };
         assert!(safe_directory(&folder, &entry, &[entry.clone(), other]).is_none());
+        let parent_owner = Entry { subkey: "parent".into(), install_location: root.to_string_lossy().into_owned(), ..entry.clone() };
+        assert!(safe_directory(&folder, &entry, &[entry.clone(), parent_owner]).is_none());
+        let duplicate_name = Entry { subkey: "same-name".into(), install_location: String::new(), ..entry.clone() };
+        assert!(same_name_elsewhere(&entry, &[entry.clone(), duplicate_name]));
         let icon_only = Entry { subkey: "icon-only".into(), install_location: String::new(),
             display_icon: folder.join("removed.exe").to_string_lossy().into_owned(), ..entry.clone() };
         assert_eq!(PathBuf::from(install_folder(&icon_only).unwrap()), folder.canonicalize().unwrap());
         assert!(safe_directory(&folder, &entry, &[entry.clone(), icon_only]).is_none());
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let documents = PathBuf::from(home).join("Documents");
+            if documents.is_dir() {
+                assert!(safe_directory(&documents, &entry, &[entry.clone()]).is_none());
+            }
+        }
+        let link = root.join("linked");
+        if std::os::windows::fs::symlink_dir(&folder, &link).is_ok() {
+            assert!(safe_directory(&link, &entry, &[entry.clone()]).is_none());
+            assert!(ensure_no_reparse_points(&root).is_err());
+            std::fs::remove_dir(&link).unwrap();
+        }
         assert!(registry_display_path(&entry).contains("HKEY_CURRENT_USER"));
         let x86 = Entry { machine: true, view: VIEW_32, ..entry.clone() };
         assert!(registry_display_path(&x86).contains("SOFTWARE\\Wow6432Node\\"));
@@ -858,7 +959,7 @@ mod tests {
         assert!(matches!(candidates.last(), Some(RemovalTarget::Registry { parent, name, .. })
             if parent == UNINSTALL_KEY && name == "demo"));
         std::fs::remove_dir(&folder).unwrap();
-        let store_root = std::env::current_dir().unwrap().join("target/store-cleanup-fixture");
+        let store_root = root.join("Store");
         let store_folder = store_root.join("Packages/Demo_publisher");
         std::fs::create_dir_all(&store_folder).unwrap();
         let store = Entry { package: "Demo_1.0_x64__publisher".into(),
@@ -867,7 +968,7 @@ mod tests {
             Some(store_folder.canonicalize().unwrap()));
         let invalid = Entry { package_family: "..\\Other".into(), ..store.clone() };
         assert!(store_data_directory(&invalid, &[invalid.clone()], &store_root).is_none());
-        std::fs::remove_dir_all(&store_root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -985,6 +1086,7 @@ unsafe extern "system" fn uninstall_wait_proc(window: Hwnd, message_id: u32, _wp
 }
 
 fn wait_for_desktop_uninstall(owner: Hwnd, entry: &Entry, file: String, args: String) -> Result<(), String> {
+    let powershell = powershell()?;
     unsafe {
         let instance = GetModuleHandleW(null());
         let class_name = wide("HandyUninstallWait");
@@ -1013,7 +1115,7 @@ fn wait_for_desktop_uninstall(owner: Hwnd, entry: &Entry, file: String, args: St
             let launch = format!("Start-Process -FilePath {}{} -PassThru -Wait",
                 ps_quote(&file), parameters);
             let script = format!("$ErrorActionPreference='Stop'; try {{ try {{ $p={launch} }} catch {{ $e=$_.Exception; while ($e -and $e -isnot [System.ComponentModel.Win32Exception]) {{ $e=$e.InnerException }}; if ($e -and $e.NativeErrorCode -eq 5) {{ $p={launch} -Verb RunAs }} else {{ throw }} }}; if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {{ throw ('卸载程序退出代码：' + $p.ExitCode) }} }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}");
-            let result = Command::new("powershell.exe")
+            let result = Command::new(powershell)
                 .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                 .creation_flags(0x08000000).output()
                 .map_err(|error| error.to_string())
@@ -1622,8 +1724,14 @@ impl AppState {
             message(self.window, "无法打开注册表编辑器", &format!("注册表错误代码：{status}"), 0x10);
             return;
         }
+        let regedit = match system_directory().and_then(|path| path.parent()
+            .map(|root| root.join("regedit.exe"))
+            .ok_or_else(|| "无法定位注册表编辑器".to_owned())) {
+            Ok(path) => path,
+            Err(error) => { message(self.window, "无法打开注册表编辑器", &error, 0x10); return; }
+        };
         let result = unsafe { ShellExecuteW(self.window, wide("open").as_ptr(),
-            wide("regedit.exe").as_ptr(), wide("/m").as_ptr(), null(), 1) };
+            wide(&regedit.to_string_lossy()).as_ptr(), wide("/m").as_ptr(), null(), 1) };
         if result <= 32 { message(self.window, "无法打开注册表编辑器", &format!("ShellExecute 错误代码：{result}"), 0x10); }
     }
 
@@ -1655,7 +1763,11 @@ impl AppState {
         let path = format!("{UNINSTALL_KEY}\\{}", entry.subkey);
         open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some_and(|key|
             text_value(key.0, "DisplayName").trim() == entry.name
-                && text_value(key.0, "UninstallString").trim() == entry.command)
+                && text_value(key.0, "UninstallString").trim() == entry.command
+                && text_value(key.0, "Publisher").trim() == entry.publisher
+                && text_value(key.0, "InstallLocation").trim() == entry.install_location
+                && text_value(key.0, "DisplayIcon").trim() == entry.display_icon
+                && is_one(key.0, "WindowsInstaller") == entry.msi)
     }
 
     fn force_remove(&mut self) {
@@ -1676,7 +1788,13 @@ impl AppState {
             message(self.window, "条目已变化", "注册表条目内容已变化，请刷新列表。", 0x30);
             return false;
         }
-        let entries = self.entries.clone();
+        let entries = match cleanup_inventory(entry) {
+            Ok(entries) => entries,
+            Err(error) => {
+                message(self.window, "扫描未完成", &format!("应用列表读取失败，已停止清理：\n{error}"), 0x30);
+                return false;
+            }
+        };
         let mut candidates = removal_candidates(entry, &entries);
         candidates.retain(RemovalTarget::exists);
         if candidates.is_empty() {
@@ -1695,7 +1813,14 @@ impl AppState {
             message(self.window, "条目已变化", "注册表条目内容已变化，请刷新列表。", 0x30);
             return false;
         }
-        let fresh = removal_candidates(entry, &entries);
+        let fresh_entries = match cleanup_inventory(entry) {
+            Ok(entries) => entries,
+            Err(error) => {
+                message(self.window, "复核未完成", &format!("应用列表读取失败，已停止清理：\n{error}"), 0x30);
+                return false;
+            }
+        };
+        let fresh = removal_candidates(entry, &fresh_entries);
         let mut errors = Vec::new();
         let registration = candidates.last().filter(|target| matches!(target,
             RemovalTarget::Registry { parent, .. } if parent == UNINSTALL_KEY));
@@ -1706,7 +1831,7 @@ impl AppState {
                 continue;
             }
             if let RemovalTarget::Directory(path) = candidate {
-                if safe_directory(path, entry, &entries).as_ref() != Some(path) {
+                if safe_directory(path, entry, &fresh_entries).as_ref() != Some(path) {
                     errors.push(format!("{}：路径已变化或不安全", candidate.description()));
                     continue;
                 }
@@ -1715,7 +1840,9 @@ impl AppState {
         }
         if errors.is_empty() {
             if let Some(target) = registration {
-                if let Err(error) = target.delete() { errors.push(error); }
+                if Self::entry_unchanged(entry) {
+                    if let Err(error) = target.delete() { errors.push(error); }
+                } else { errors.push("卸载登记项已变化，已保留该条目".into()); }
             }
         }
         if errors.is_empty() {
@@ -1824,9 +1951,9 @@ impl AppState {
             let mut error = None;
             for entry in entries {
                 let command = store_uninstall_command(&entry.package);
-                let result = Command::new("powershell.exe")
+                let result = powershell().and_then(|path| Command::new(path)
                     .args(["-NoProfile", "-NonInteractive", "-Command", &command])
-                    .creation_flags(0x08000000).status()
+                    .creation_flags(0x08000000).status().map_err(|cause| cause.to_string()))
                     .map_err(|cause| format!("{}：{cause}", entry.name))
                     .and_then(|status| if status.success() { Ok(()) } else {
                         Err(format!("{}：PowerShell 退出代码 {:?}", entry.name, status.code()))
@@ -1846,17 +1973,23 @@ impl AppState {
 
     fn uninstall_desktop(&mut self, entry: &Entry) -> bool {
         let path = format!("{UNINSTALL_KEY}\\{}", entry.subkey);
-        let current = open_key(hive(entry.machine), &path, entry.view, KEY_READ)
-            .map(|key| text_value(key.0, "UninstallString").trim().to_owned()).unwrap_or_default();
-        if current != entry.command {
-            message(self.window, "卸载信息已变化", &format!("“{}”的卸载命令已变化，请刷新后重试。", entry.name), 0x30);
+        if !Self::entry_unchanged(entry) {
+            message(self.window, "卸载信息已变化", &format!("“{}”的登记信息已变化，请刷新后重试。", entry.name), 0x30);
             return false;
         }
-        let command = if entry.msi { msi_command(&current) } else { current };
+        let command = if entry.msi { msi_command(&entry.command) } else { entry.command.clone() };
         if message(self.window, "确认卸载", &format!("应用：{}\n\n将执行：\n{}\n\n继续吗？",
             entry.name, command), 0x24) != 6 { return false; }
+        if !Self::entry_unchanged(entry) {
+            message(self.window, "卸载信息已变化", "卸载登记项在确认期间发生变化，请刷新后重试。", 0x30);
+            return false;
+        }
         let (file, args) = match split_command(&command) {
             Ok(parts) => parts,
+            Err(error) => { message(self.window, "无法启动卸载程序", &error, 0x10); return false; }
+        };
+        let file = match uninstall_executable(&file) {
+            Ok(file) => file,
             Err(error) => { message(self.window, "无法启动卸载程序", &error, 0x10); return false; }
         };
         if let Err(error) = wait_for_desktop_uninstall(self.window, entry, file, args) {
@@ -1884,8 +2017,10 @@ fn store_family_absent(family: &str) -> bool {
     if !single_key_component(family) { return false; }
     let script = format!("$ErrorActionPreference='Stop'; if (Get-AppxPackage | Where-Object {{ $_.PackageFamilyName -eq {} }}) {{ exit 1 }}",
         ps_quote(family));
-    Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(0x08000000).status().is_ok_and(|status| status.success())
+    powershell().and_then(|path| Command::new(path)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(0x08000000).status().map_err(|error| error.to_string()))
+        .is_ok_and(|status| status.success())
 }
 
 impl Drop for AppState {
