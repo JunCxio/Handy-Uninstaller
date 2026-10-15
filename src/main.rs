@@ -2601,25 +2601,11 @@ impl AppState {
             return false;
         }
         let command = if entry.msi { msi_command(&entry.command) } else { entry.command.clone() };
-        if message(self.window, "确认卸载", &format!("应用：{}\n\n将执行：\n{}\n\n请先退出正在运行的应用。卸载程序执行的操作无法通过“撤销清理”恢复；该按钮仅能恢复 Handy 随后清理的残留项。\n\n继续吗？",
+        if message(self.window, "确认卸载", &format!("应用：{}\n\n将执行：\n{}\n\n卸载程序执行的操作无法通过“撤销清理”恢复；该按钮仅能恢复 Handy 随后清理的残留项。\n\n继续吗？",
             entry.name, command), 0x24) != 6 { return false; }
         if !Self::entry_unchanged(entry) {
             message(self.window, "卸载信息已变化", "卸载登记项在确认期间发生变化，请刷新后重试。", 0x30);
             return false;
-        }
-        match running_install_process(entry) {
-            Ok(Some(pid)) => {
-                let detail = format!("应用仍在运行（PID {pid}），本次尚未开始卸载。请从应用界面或托盘选择“退出”，再右键重新卸载。直接关闭窗口可能只会将应用隐藏到托盘。");
-                let _ = log_operation("桌面应用卸载已阻止", &entry.name, &detail);
-                message(self.window, "应用仍在运行", &detail, 0x30);
-                return false;
-            }
-            Err(error) => {
-                if message(self.window, "无法检查运行进程", &format!("无法确认应用是否仍在运行：{error}\n\n继续执行卸载吗？"), 0x124) != 6 {
-                    return false;
-                }
-            }
-            Ok(None) => {}
         }
         let (file, args) = match split_command(&command) {
             Ok(parts) => parts,
@@ -2654,22 +2640,6 @@ impl AppState {
 }
 
 fn ps_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "''")) }
-
-fn running_install_process(entry: &Entry) -> Result<Option<u32>, String> {
-    let Some(folder) = install_folder(entry) else { return Ok(None); };
-    if safe_directory(Path::new(&folder), entry, &cleanup_inventory(entry)?).is_none() {
-        return Ok(None);
-    }
-    let folder = format!("{}\\", folder.trim_end_matches(['\\', '/']));
-    let script = format!("$ErrorActionPreference='Stop'; $folder={}; Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath.StartsWith($folder, [StringComparison]::OrdinalIgnoreCase) }} | Select-Object -ExpandProperty ProcessId",
-        ps_quote(&folder));
-    let output = Command::new(powershell()?).args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(0x08000000).output().map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().chars().take(500).collect());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().find_map(|line| line.trim().parse().ok()))
-}
 
 fn store_uninstall_command(package: &str) -> String {
     format!("Remove-AppxPackage -Package {} -ErrorAction Stop", ps_quote(package))
