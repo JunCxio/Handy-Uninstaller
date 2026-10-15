@@ -291,20 +291,26 @@ fn color(red: u8, green: u8, blue: u8) -> u32 {
 }
 #[derive(Clone, Copy)]
 struct Palette { background: u32, chrome: u32, text: u32, muted: u32, line: u32,
-    accent: u32, selected: u32, input: u32, badge: u32 }
+    accent: u32, selected: u32, input: u32, inactive_input: u32,
+    inactive_line: u32, inactive_text: u32, badge: u32 }
 
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette { background: color(15, 23, 36), chrome: color(18, 30, 46),
             text: color(230, 240, 251), muted: color(148, 169, 193),
             line: color(42, 59, 80), accent: color(105, 172, 255),
-            selected: color(30, 54, 84), input: color(25, 39, 57), badge: color(35, 53, 75) }
+            selected: color(30, 54, 84), input: color(25, 39, 57),
+            inactive_input: color(30, 45, 64), inactive_line: color(57, 77, 99),
+            inactive_text: color(130, 151, 175),
+            badge: color(42, 61, 82) }
     } else {
         Palette { background: color(255, 255, 255), chrome: color(248, 250, 253),
             text: color(24, 45, 72), muted: color(104, 128, 158),
             line: color(228, 235, 244), accent: color(22, 111, 217),
             selected: color(234, 244, 255), input: color(255, 255, 255),
-            badge: color(242, 246, 251) }
+            inactive_input: color(240, 242, 245), inactive_line: color(205, 218, 232),
+            inactive_text: color(149, 164, 181),
+            badge: color(232, 239, 245) }
     }
 }
 
@@ -1201,7 +1207,8 @@ struct AppState {
     desktop_tab: Hwnd, store_tab: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
     title_font: Handle, body_font: Handle, small_font: Handle, bold_font: Handle, stat_font: Handle,
     icon_font: Handle,
-    edit_brush: Handle, status_brush: Handle, dark: bool, store_view: bool, search_placeholder: bool,
+    edit_brush: Handle, inactive_brush: Handle, status_brush: Handle,
+    dark: bool, store_view: bool, search_placeholder: bool,
     entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
     deleting: bool, uninstalling: bool, sort_column: usize, sort_descending: bool,
     monitor_stop: Option<Arc<AtomicBool>>, monitor_pending: bool,
@@ -1252,6 +1259,7 @@ impl AppState {
         let state = Self { window, search, refresh, monitor, theme, desktop_tab, store_tab, list, status, images,
             title_font, body_font, small_font, bold_font, stat_font, icon_font,
             edit_brush: unsafe { CreateSolidBrush(colors.input) },
+            inactive_brush: unsafe { CreateSolidBrush(colors.inactive_input) },
             status_brush: unsafe { CreateSolidBrush(colors.chrome) }, dark, store_view: false,
             search_placeholder: true,
             entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false,
@@ -1298,6 +1306,7 @@ impl AppState {
     }
 
     fn static_brush(&self, dc: Handle, control: Hwnd) -> Handle {
+        if control == self.search { return self.edit_brush(dc); }
         if control != self.status { return 0; }
         let colors = palette(self.dark);
         unsafe { SetBkColor(dc, colors.chrome); SetTextColor(dc, colors.muted); }
@@ -1306,9 +1315,11 @@ impl AppState {
 
     fn edit_brush(&self, dc: Handle) -> Handle {
         let colors = palette(self.dark);
-        unsafe { SetBkColor(dc, colors.input);
-            SetTextColor(dc, if self.search_placeholder { colors.muted } else { colors.text }); }
-        self.edit_brush
+        let inactive = self.loading || self.deleting || self.uninstalling;
+        unsafe { SetBkColor(dc, if inactive { colors.inactive_input } else { colors.input });
+            SetTextColor(dc, if inactive { colors.inactive_text }
+                else if self.search_placeholder { colors.muted } else { colors.text }); }
+        if inactive { self.inactive_brush } else { self.edit_brush }
     }
 
     fn color_list(&self) {
@@ -1325,8 +1336,10 @@ impl AppState {
         let colors = palette(self.dark);
         unsafe {
             DeleteObject(self.edit_brush);
+            DeleteObject(self.inactive_brush);
             DeleteObject(self.status_brush);
             self.edit_brush = CreateSolidBrush(colors.input);
+            self.inactive_brush = CreateSolidBrush(colors.inactive_input);
             self.status_brush = CreateSolidBrush(colors.chrome);
             SetWindowTextW(self.theme, wide(if self.dark { "浅色模式" } else { "深色模式" }).as_ptr());
             for control in [self.window, self.search, self.monitor, self.refresh,
@@ -1364,10 +1377,12 @@ impl AppState {
         draw_text(dc, if self.store_view { "个商店应用" } else { "个桌面应用" },
             Rect { left: width - 112, top: 39, right: width - 31, bottom: 62 },
             self.small_font, colors.muted, 0x20 | 0x4);
+        let search_inactive = self.loading || self.deleting || self.uninstalling;
         rounded(dc, Rect { left: 32, top: 124, right: 424, bottom: 164 },
-            colors.input, colors.line, 10);
+            if search_inactive { colors.inactive_input } else { colors.input },
+            if search_inactive { colors.inactive_line } else { colors.line }, 10);
         unsafe {
-            let pen = CreatePen(0, 2, colors.muted);
+            let pen = CreatePen(0, 2, if search_inactive { colors.inactive_text } else { colors.muted });
             let old_pen = SelectObject(dc, pen);
             let old_brush = SelectObject(dc, GetStockObject(5));
             Ellipse(dc, 51, 138, 61, 148);
@@ -1430,12 +1445,15 @@ impl AppState {
         }
         let primary = id == ID_MONITOR;
         fill(item.dc, item.rect, colors.background);
-        let background = if primary { if pressed { color(13, 88, 180) } else { color(25, 112, 218) } }
+        let background = if primary && disabled { colors.badge }
+            else if primary { if pressed { color(13, 88, 180) } else { color(25, 112, 218) } }
             else if pressed { colors.selected } else { colors.background };
         rounded(item.dc, Rect { left: item.rect.left + 1, top: item.rect.top + 1,
             right: item.rect.right - 1, bottom: item.rect.bottom - 1 }, background,
-            if primary { background } else { colors.line }, 10);
-        let ink = if disabled { colors.muted } else if primary { color(255, 255, 255) } else { colors.text };
+            if primary && disabled { colors.inactive_line }
+            else if primary { background } else { colors.line }, 10);
+        let ink = if disabled { colors.inactive_text }
+            else if primary { color(255, 255, 255) } else { colors.text };
         if id == ID_THEME || id == ID_REFRESH {
             let symbol = if id == ID_REFRESH { "\u{E895}" }
                 else if self.dark { "\u{E706}" } else { "\u{E708}" };
@@ -1469,13 +1487,13 @@ impl AppState {
             &entry.install_date].iter().enumerate() {
             let right = start + widths[column + 1];
             if column == 2 {
-                let badge_width = if entry.package.is_empty() { 110 } else { 150 };
                 let badge = Rect { left: start + 10, top: item.rect.top + 9,
-                    right: (start + 10 + badge_width).min(right - 8), bottom: item.rect.bottom - 9 };
-                rounded(item.dc, badge, colors.badge, colors.badge, 8);
+                    right: (start + 120).min(right - 8), bottom: item.rect.bottom - 9 };
+                rounded(item.dc, badge, colors.badge, colors.badge, 6);
                 draw_text(item.dc, value, Rect { left: badge.left + 7, top: badge.top,
                     right: badge.right - 4, bottom: badge.bottom }, self.small_font,
-                    colors.muted, 0x20 | 0x4 | 0x8000);
+                    if self.dark { colors.muted } else { color(76, 101, 128) },
+                    0x20 | 0x4 | 0x8000);
             } else {
                 draw_text(item.dc, if column == 3 && value.is_empty() { "—" } else { value },
                     Rect { left: start + 16, top: item.rect.top, right: right - 8,
@@ -1613,7 +1631,7 @@ impl AppState {
             self.refresh, self.monitor] {
             unsafe { EnableWindow(control, enabled); }
         }
-        unsafe { InvalidateRect(self.list, null(), 0); }
+        unsafe { InvalidateRect(self.window, null(), 0); InvalidateRect(self.list, null(), 0); }
     }
 
     fn selected_indices(&self) -> Vec<usize> {
@@ -2029,7 +2047,8 @@ impl Drop for AppState {
         unsafe {
             if self.images != 0 { ImageList_Destroy(self.images); }
             for object in [self.title_font, self.body_font, self.small_font,
-                self.bold_font, self.stat_font, self.icon_font, self.edit_brush, self.status_brush] {
+                self.bold_font, self.stat_font, self.icon_font, self.edit_brush,
+                self.inactive_brush, self.status_brush] {
                 if object != 0 { DeleteObject(object); }
             }
         }
