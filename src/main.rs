@@ -41,6 +41,7 @@ const WM_PAINT: u32 = 0x000f;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SIZE: u32 = 5;
 const WM_DESTROY: u32 = 2;
+const WM_CLOSE: u32 = 0x0010;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_COMMAND: u32 = 0x0111;
 const WM_NOTIFY: u32 = 0x004e;
@@ -55,6 +56,7 @@ const WM_SETFONT: u32 = 0x0030;
 const WM_APP_LOADED: u32 = 0x8001;
 const WM_APP_UNINSTALLED: u32 = 0x8002;
 const WM_APP_MONITOR: u32 = 0x8003;
+const WM_APP_DESKTOP_DONE: u32 = 0x8004;
 const LVM_FIRST: u32 = 0x1000;
 const LVM_SETBKCOLOR: u32 = LVM_FIRST + 1;
 const LVM_SETIMAGELIST: u32 = LVM_FIRST + 3;
@@ -85,6 +87,8 @@ const MENU_REMOVE_ENTRY: u32 = 203;
 const MENU_REGISTRY: u32 = 204;
 const MENU_FOLDER: u32 = 205;
 const MENU_BATCH_UNINSTALL: u32 = 206;
+const ID_REMOVE_CONFIRM: usize = 301;
+const ID_REMOVE_CANCEL: usize = 302;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -176,7 +180,9 @@ extern "system" {
     fn SetWindowLongPtrW(window: Hwnd, index: i32, value: isize) -> isize;
     fn GetWindowLongPtrW(window: Hwnd, index: i32) -> isize;
     fn GetClientRect(window: Hwnd, rect: *mut Rect) -> i32;
+    fn GetWindowRect(window: Hwnd, rect: *mut Rect) -> i32;
     fn MoveWindow(window: Hwnd, x: i32, y: i32, width: i32, height: i32, repaint: i32) -> i32;
+    fn DestroyWindow(window: Hwnd) -> i32;
     fn BeginPaint(window: Hwnd, paint: *mut PaintStruct) -> Handle;
     fn EndPaint(window: Hwnd, paint: *const PaintStruct) -> i32;
     fn InvalidateRect(window: Hwnd, rect: *const Rect, erase: i32) -> i32;
@@ -419,7 +425,7 @@ fn is_one(key: Hkey, name: &str) -> bool {
 #[derive(Clone)]
 struct Entry {
     name: String, version: String, publisher: String, source: String,
-    command: String, subkey: String, package: String,
+    command: String, subkey: String, package: String, package_family: String,
     display_icon: String, install_location: String,
     install_date: String, machine: bool, view: u32, msi: bool, image: i32,
 }
@@ -469,7 +475,7 @@ fn registry_apps(errors: &mut Vec<String>) -> Vec<Entry> {
                 entries.push(Entry {
                     name: display_name, version: text_value(key.0, "DisplayVersion").trim().to_owned(),
                     publisher: text_value(key.0, "Publisher").trim().to_owned(), source: source.clone(),
-                    command, subkey, package: String::new(),
+                    command, subkey, package: String::new(), package_family: String::new(),
                     display_icon: text_value(key.0, "DisplayIcon").trim().to_owned(),
                     install_location: text_value(key.0, "InstallLocation").trim().to_owned(),
                     install_date: install_date(text_value(key.0, "InstallDate").trim()),
@@ -509,12 +515,14 @@ fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
     }
     String::from_utf8_lossy(&bytes).lines().filter_map(|line| {
         let mut fields = line.split('\t');
-        let (name, package, version, location, icon) =
-            (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
-        if name.is_empty() || package.is_empty() || fields.next().is_some() { return None; }
+        let (name, package, family, version, location, icon) =
+            (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+        if name.is_empty() || package.is_empty() || !single_key_component(family)
+            || fields.next().is_some() { return None; }
         Some(Entry { name: name.into(), version: version.into(), publisher: String::new(),
             source: "商店应用".into(), command: String::new(), subkey: String::new(),
-            package: package.into(), display_icon: icon.into(), install_location: location.into(),
+            package: package.into(), package_family: family.into(),
+            display_icon: icon.into(), install_location: location.into(),
             install_date: String::new(), machine: false, view: 0, msi: false, image: 0 })
     }).collect()
 }
@@ -627,7 +635,7 @@ fn registry_display_path(entry: &Entry) -> String {
     format!("Computer\\{root}\\{path}\\{}", entry.subkey)
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum RemovalTarget {
     Directory(PathBuf),
     Shortcut(PathBuf),
@@ -646,8 +654,8 @@ impl RemovalTarget {
 
     fn description(&self) -> String {
         match self {
-            Self::Directory(path) => format!("文件夹：{}", path.display()),
-            Self::Shortcut(path) => format!("快捷方式：{}", path.display()),
+            Self::Directory(path) => format!("文件夹：{}", display_path(path)),
+            Self::Shortcut(path) => format!("快捷方式：{}", display_path(path)),
             Self::Registry { machine, view, parent, name } => format!("注册表：{}\\{}\\{}（{} 位）",
                 if *machine { "HKLM" } else { "HKCU" }, parent, name,
                 if *view == VIEW_32 { 32 } else { 64 }),
@@ -666,6 +674,12 @@ impl RemovalTarget {
             }
         }
     }
+}
+
+fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") { format!(r"\\{rest}") }
+    else { text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned() }
 }
 
 fn single_key_component(name: &str) -> bool {
@@ -698,8 +712,31 @@ fn safe_directory(path: &Path, entry: &Entry, entries: &[Entry]) -> Option<PathB
     Some(path)
 }
 
+fn store_data_directory(entry: &Entry, entries: &[Entry], local_app_data: &Path) -> Option<PathBuf> {
+    if !single_key_component(&entry.package_family) { return None; }
+    let root = local_app_data.join("Packages").canonicalize().ok()?;
+    let folder = safe_directory(&root.join(&entry.package_family), entry, entries)?;
+    folder.starts_with(root).then_some(folder)
+}
+
 fn removal_candidates(entry: &Entry, entries: &[Entry]) -> Vec<RemovalTarget> {
-    if !entry.package.is_empty() { return Vec::new(); }
+    if !entry.package.is_empty() {
+        let mut candidates = Vec::new();
+        if let Some(folder) = std::env::var_os("LOCALAPPDATA").and_then(|root|
+            store_data_directory(entry, entries, Path::new(&root))) {
+            candidates.push(RemovalTarget::Directory(folder));
+        }
+        for (parent, name) in [
+            ("SOFTWARE\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\SystemAppData", &entry.package_family),
+            ("SOFTWARE\\Classes\\ActivatableClasses\\Package", &entry.package),
+        ] {
+            if single_key_component(name) && open_key(hive(false), &format!("{parent}\\{name}"), VIEW_64, KEY_READ).is_some() {
+                candidates.push(RemovalTarget::Registry { machine: false, view: VIEW_64,
+                    parent: parent.into(), name: name.clone() });
+            }
+        }
+        return candidates;
+    }
     let mut candidates = Vec::new();
     let install = install_folder(entry).and_then(|location|
         safe_directory(Path::new(&location), entry, entries));
@@ -777,6 +814,9 @@ mod tests {
             ("C:\\Apps\\Demo, Inc\\app.exe".into(), 0));
         assert_eq!(store_uninstall_command("Demo'Package"),
             "Remove-AppxPackage -Package 'Demo''Package' -ErrorAction Stop");
+        assert_eq!(display_path(Path::new(r"\\?\C:\Demo")), r"C:\Demo");
+        assert_eq!(display_path(Path::new(r"\\?\UNC\server\share")), r"\\server\share");
+        assert!(!store_family_absent("..\\Other"));
     }
     #[test] fn date_and_sort() {
         assert_eq!(install_date("20261015"), "2026-10-15");
@@ -786,7 +826,8 @@ mod tests {
         assert!(install_date("unknown").is_empty());
         let basic = Entry { name: "B".into(), version: String::new(), publisher: String::new(),
             source: String::new(), command: String::new(), subkey: String::new(),
-            package: String::new(), display_icon: String::new(), install_location: String::new(),
+            package: String::new(), package_family: String::new(),
+            display_icon: String::new(), install_location: String::new(),
             install_date: "2026-01-01".into(), machine: false, view: 0, msi: false, image: 0 };
         let newer = Entry { name: "A".into(), install_date: "2026-10-15".into(), ..basic.clone() };
         let unknown = Entry { name: "C".into(), install_date: String::new(), ..basic.clone() };
@@ -800,7 +841,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let entry = Entry { name: "Demo".into(), version: String::new(), publisher: String::new(),
             source: String::new(), command: "uninstall.exe".into(), subkey: "demo".into(),
-            package: String::new(), display_icon: String::new(),
+            package: String::new(), package_family: String::new(), display_icon: String::new(),
             install_location: folder.to_string_lossy().into_owned(), install_date: String::new(), machine: false, view: VIEW_64,
             msi: false, image: 0 };
         assert!(safe_directory(&folder, &entry, &[entry.clone()]).is_some());
@@ -817,11 +858,188 @@ mod tests {
         assert!(matches!(candidates.last(), Some(RemovalTarget::Registry { parent, name, .. })
             if parent == UNINSTALL_KEY && name == "demo"));
         std::fs::remove_dir(&folder).unwrap();
+        let store_root = std::env::current_dir().unwrap().join("target/store-cleanup-fixture");
+        let store_folder = store_root.join("Packages/Demo_publisher");
+        std::fs::create_dir_all(&store_folder).unwrap();
+        let store = Entry { package: "Demo_1.0_x64__publisher".into(),
+            package_family: "Demo_publisher".into(), install_location: String::new(), ..entry.clone() };
+        assert_eq!(store_data_directory(&store, &[store.clone()], &store_root),
+            Some(store_folder.canonicalize().unwrap()));
+        let invalid = Entry { package_family: "..\\Other".into(), ..store.clone() };
+        assert!(store_data_directory(&invalid, &[invalid.clone()], &store_root).is_none());
+        std::fs::remove_dir_all(&store_root).unwrap();
     }
 }
 
 fn message(window: Hwnd, title: &str, text: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(window, wide(text).as_ptr(), wide(title).as_ptr(), flags) }
+}
+
+struct RemovalDialog {
+    list: Hwnd,
+    count: usize,
+    selected: Vec<usize>,
+    done: bool,
+}
+
+unsafe extern "system" fn removal_dialog_proc(window: Hwnd, message_id: u32, wparam: usize, lparam: isize) -> isize {
+    let state = GetWindowLongPtrW(window, -21) as *mut RemovalDialog;
+    match message_id {
+        WM_COMMAND if !state.is_null() => match wparam & 0xffff {
+            ID_REMOVE_CONFIRM => {
+                (*state).selected = (0..(*state).count).filter(|index|
+                    SendMessageW((*state).list, LVM_GETITEMSTATE, *index, 0xf000) & 0xf000 == 0x2000)
+                    .collect();
+                DestroyWindow(window);
+                return 0;
+            }
+            ID_REMOVE_CANCEL => { DestroyWindow(window); return 0; }
+            _ => {}
+        },
+        WM_CLOSE => { DestroyWindow(window); return 0; }
+        WM_DESTROY if !state.is_null() => { (*state).done = true; return 0; }
+        WM_NCDESTROY => { SetWindowLongPtrW(window, -21, 0); }
+        _ => {}
+    }
+    DefWindowProcW(window, message_id, wparam, lparam)
+}
+
+fn choose_removals(owner: Hwnd, entry: &Entry, candidates: &[RemovalTarget]) -> Vec<usize> {
+    unsafe {
+        let instance = GetModuleHandleW(null());
+        let class_name = wide("HandyRemovalDialog");
+        RegisterClassW(&WndClass { style: 0, proc: Some(removal_dialog_proc), class_extra: 0,
+            window_extra: 0, instance, icon: 0, cursor: LoadCursorW(0, 32512usize as *const u16),
+            background: 6, menu_name: null(), class_name: class_name.as_ptr() });
+        let mut parent: Rect = zeroed();
+        GetWindowRect(owner, &mut parent);
+        let dialog = CreateWindowExW(1, class_name.as_ptr(), wide("残留检测结果").as_ptr(),
+            0x00c80000, parent.left + (parent.right - parent.left - 820) / 2,
+            parent.top + (parent.bottom - parent.top - 510) / 2, 820, 510,
+            owner, 0, instance, null_mut());
+        if dialog == 0 { return Vec::new(); }
+        let heading = create_control(instance, dialog, "STATIC",
+            &format!("“{}”：发现 {} 个候选项。取消勾选可保留对应项目。", entry.name, candidates.len()),
+            WS_CHILD | WS_VISIBLE, 0, 0);
+        MoveWindow(heading, 20, 18, 770, 28, 1);
+        let list = create_control(instance, dialog, "SysListView32", "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 0x200, 0);
+        MoveWindow(list, 20, 52, 774, 365, 1);
+        SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0x424, 0x424);
+        let column_width = candidates.iter().map(|target| target.description().chars().count() as i32 * 10)
+            .max().unwrap_or(745).clamp(745, 6000);
+        add_column(list, 0, "勾选要删除的文件、快捷方式或注册表项", column_width);
+        for (index, candidate) in candidates.iter().enumerate() {
+            let mut description = wide(&candidate.description());
+            let mut item: LvItem = zeroed();
+            item.mask = 1;
+            item.item = index as i32;
+            item.text = description.as_mut_ptr();
+            SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const _ as isize);
+            item.state = 0x2000;
+            item.state_mask = 0xf000;
+            SendMessageW(list, LVM_SETITEMSTATE, index, &item as *const _ as isize);
+        }
+        let confirm = create_control(instance, dialog, "BUTTON", "清理所选项目",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, ID_REMOVE_CONFIRM);
+        let cancel = create_control(instance, dialog, "BUTTON", "取消",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, ID_REMOVE_CANCEL);
+        MoveWindow(confirm, 600, 428, 116, 32, 1);
+        MoveWindow(cancel, 724, 428, 70, 32, 1);
+        let mut state = RemovalDialog { list, count: candidates.len(), selected: Vec::new(), done: false };
+        SetWindowLongPtrW(dialog, -21, &mut state as *mut _ as isize);
+        EnableWindow(owner, 0);
+        ShowWindow(dialog, 5);
+        UpdateWindow(dialog);
+        let mut event: Msg = zeroed();
+        while !state.done {
+            if GetMessageW(&mut event, 0, 0, 0) <= 0 {
+                DestroyWindow(dialog);
+                PostQuitMessage(0);
+                break;
+            }
+            TranslateMessage(&event);
+            DispatchMessageW(&event);
+        }
+        EnableWindow(owner, 1);
+        SetFocus(owner);
+        state.selected
+    }
+}
+
+struct UninstallWait { result: Option<Result<(), String>> }
+
+unsafe extern "system" fn uninstall_wait_proc(window: Hwnd, message_id: u32, _wparam: usize, lparam: isize) -> isize {
+    let state = GetWindowLongPtrW(window, -21) as *mut UninstallWait;
+    match message_id {
+        WM_APP_DESKTOP_DONE if !state.is_null() => {
+            (*state).result = Some(*Box::from_raw(lparam as *mut Result<(), String>));
+            DestroyWindow(window);
+            return 0;
+        }
+        WM_CLOSE => return 0,
+        WM_NCDESTROY => { SetWindowLongPtrW(window, -21, 0); }
+        _ => {}
+    }
+    DefWindowProcW(window, message_id, _wparam, lparam)
+}
+
+fn wait_for_desktop_uninstall(owner: Hwnd, entry: &Entry, file: String, args: String) -> Result<(), String> {
+    unsafe {
+        let instance = GetModuleHandleW(null());
+        let class_name = wide("HandyUninstallWait");
+        RegisterClassW(&WndClass { style: 0, proc: Some(uninstall_wait_proc), class_extra: 0,
+            window_extra: 0, instance, icon: 0, cursor: LoadCursorW(0, 32512usize as *const u16),
+            background: 6, menu_name: null(), class_name: class_name.as_ptr() });
+        let mut parent: Rect = zeroed();
+        GetWindowRect(owner, &mut parent);
+        let dialog = CreateWindowExW(1, class_name.as_ptr(), wide("卸载进行中").as_ptr(),
+            0x00c00000, parent.left + (parent.right - parent.left - 520) / 2,
+            parent.top + (parent.bottom - parent.top - 150) / 2, 520, 150,
+            owner, 0, instance, null_mut());
+        if dialog == 0 { return Err("无法创建卸载进度窗口".into()); }
+        let label = create_control(instance, dialog, "STATIC",
+            &format!("正在卸载“{}”。请完成卸载程序中的操作。", entry.name),
+            WS_CHILD | WS_VISIBLE, 0, 0);
+        MoveWindow(label, 24, 28, 472, 60, 1);
+        let mut state = UninstallWait { result: None };
+        SetWindowLongPtrW(dialog, -21, &mut state as *mut _ as isize);
+        EnableWindow(owner, 0);
+        ShowWindow(dialog, 5);
+        UpdateWindow(dialog);
+        thread::spawn(move || {
+            let parameters = if args.is_empty() { String::new() }
+                else { format!(" -ArgumentList {}", ps_quote(&args)) };
+            let launch = format!("Start-Process -FilePath {}{} -PassThru -Wait",
+                ps_quote(&file), parameters);
+            let script = format!("$ErrorActionPreference='Stop'; try {{ try {{ $p={launch} }} catch {{ $e=$_.Exception; while ($e -and $e -isnot [System.ComponentModel.Win32Exception]) {{ $e=$e.InnerException }}; if ($e -and $e.NativeErrorCode -eq 5) {{ $p={launch} -Verb RunAs }} else {{ throw }} }}; if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {{ throw ('卸载程序退出代码：' + $p.ExitCode) }} }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}");
+            let result = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(0x08000000).output()
+                .map_err(|error| error.to_string())
+                .and_then(|output| if output.status.success() { Ok(()) } else {
+                    let detail = String::from_utf8_lossy(&output.stderr).trim().chars().take(1000).collect::<String>();
+                    Err(if detail.is_empty() { format!("卸载程序退出代码：{:?}", output.status.code()) } else { detail })
+                });
+            let result = Box::into_raw(Box::new(result));
+            if PostMessageW(dialog, WM_APP_DESKTOP_DONE, 0, result as isize) == 0 {
+                drop(Box::from_raw(result));
+            }
+        });
+        let mut event: Msg = zeroed();
+        while state.result.is_none() {
+            if GetMessageW(&mut event, 0, 0, 0) <= 0 {
+                DestroyWindow(dialog);
+                PostQuitMessage(0);
+                break;
+            }
+            TranslateMessage(&event);
+            DispatchMessageW(&event);
+        }
+        EnableWindow(owner, 1);
+        SetFocus(owner);
+        state.result.unwrap_or_else(|| Err("卸载等待被中断".into()))
+    }
 }
 
 fn window_text(window: Hwnd) -> String {
@@ -1131,6 +1349,9 @@ impl AppState {
         let entry = &self.entries[index];
         let colors = palette(self.dark);
         let selected = item.state & 1 != 0;
+        let text_color = if (self.deleting || self.uninstalling) && !selected {
+            colors.muted
+        } else { colors.text };
         fill(item.dc, item.rect, if selected { colors.selected } else { colors.background });
         fill(item.dc, Rect { left: item.rect.left, top: item.rect.bottom - 1,
             right: item.rect.right, bottom: item.rect.bottom }, colors.line);
@@ -1140,7 +1361,7 @@ impl AppState {
             unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, column, 0) as i32 });
         draw_text(item.dc, &entry.name, Rect { left: item.rect.left + 52, top: item.rect.top,
             right: item.rect.left + widths[0] - 12, bottom: item.rect.bottom - 1 },
-            self.bold_font, colors.text, 0x20 | 0x4 | 0x8000);
+            self.bold_font, text_color, 0x20 | 0x4 | 0x8000);
         let mut start = item.rect.left + widths[0];
         for (column, value) in [&entry.version, &entry.publisher, &entry.source,
             &entry.install_date].iter().enumerate() {
@@ -1156,7 +1377,7 @@ impl AppState {
             } else {
                 draw_text(item.dc, if column == 3 && value.is_empty() { "—" } else { value },
                     Rect { left: start + 16, top: item.rect.top, right: right - 8,
-                        bottom: item.rect.bottom - 1 }, self.body_font, colors.text,
+                        bottom: item.rect.bottom - 1 }, self.body_font, text_color,
                     0x20 | 0x4 | 0x8000);
             }
             start = right;
@@ -1177,6 +1398,7 @@ impl AppState {
     }
 
     fn sort_at(&mut self, x: i32, y: i32) {
+        if self.deleting || self.uninstalling || self.loading { return; }
         let mut client: Rect = unsafe { zeroed() };
         unsafe { GetClientRect(self.window, &mut client); }
         if x < 32 || x >= client.right - 32 || !(226..264).contains(&y) { return; }
@@ -1196,8 +1418,7 @@ impl AppState {
         if self.loading { return; }
         self.monitor_pending = false;
         self.loading = true;
-        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.monitor, 0);
-            EnableWindow(self.desktop_tab, 0); EnableWindow(self.store_tab, 0); }
+        self.sync_controls();
         self.set_status("正在读取应用列表…");
         let window = self.window;
         thread::spawn(move || {
@@ -1264,8 +1485,7 @@ impl AppState {
         self.entries = entries;
         self.visible.clear();
         self.loading = false;
-        unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.monitor, 1);
-            EnableWindow(self.desktop_tab, 1); EnableWindow(self.store_tab, 1); }
+        self.sync_controls();
         self.rendering = false;
         self.render();
         for (row, &index) in self.visible.iter().enumerate() {
@@ -1285,6 +1505,15 @@ impl AppState {
         if row < 0 { None } else { self.visible.get(row as usize).copied() }
     }
 
+    fn sync_controls(&self) {
+        let enabled = i32::from(!self.deleting && !self.uninstalling && !self.loading);
+        for control in [self.list, self.search, self.desktop_tab, self.store_tab,
+            self.refresh, self.monitor] {
+            unsafe { EnableWindow(control, enabled); }
+        }
+        unsafe { InvalidateRect(self.list, null(), 0); }
+    }
+
     fn selected_indices(&self) -> Vec<usize> {
         let mut rows = Vec::new();
         let mut row = usize::MAX;
@@ -1298,7 +1527,7 @@ impl AppState {
     }
 
     fn context_menu(&mut self, mut point: Point, keyboard: bool) {
-        if self.loading { return; }
+        if self.loading || self.deleting || self.uninstalling { return; }
         if !keyboard {
             let mut hit = LvHitTest { point, flags: 0, item: -1, subitem: 0, group: 0 };
             unsafe { ScreenToClient(self.list, &mut hit.point); }
@@ -1339,6 +1568,7 @@ impl AppState {
             match action as u32 {
                 MENU_UNINSTALL | MENU_BATCH_UNINSTALL | MENU_FORCE_REMOVE | MENU_REMOVE_ENTRY if !busy => {
                     self.deleting = true;
+                    self.sync_controls();
                     match action as u32 {
                         MENU_UNINSTALL => self.uninstall_selected(),
                         MENU_BATCH_UNINSTALL => self.batch_uninstall_selected(),
@@ -1346,6 +1576,7 @@ impl AppState {
                         _ => self.remove_entry(),
                     }
                     self.deleting = false;
+                    self.sync_controls();
                     if self.monitor_pending && !self.uninstalling { self.refresh(); }
                 }
                 MENU_REGISTRY => self.open_registry(),
@@ -1434,33 +1665,33 @@ impl AppState {
     }
 
     fn scan_and_remove(&mut self, entry: &Entry, registered: bool) -> bool {
-        if !entry.package.is_empty() { return false; }
+        let store = !entry.package.is_empty();
+        if store && !store_family_absent(&entry.package_family) {
+            message(self.window, "暂不清理残留", "该包系列仍在系统中，或无法确认卸载结果。", 0x30);
+            return false;
+        }
         let path = format!("{UNINSTALL_KEY}\\{}", entry.subkey);
-        let current = open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some();
-        if (registered && !Self::entry_unchanged(entry)) || (!registered && current) {
+        let current = !store && open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some();
+        if !store && ((registered && !Self::entry_unchanged(entry)) || (!registered && current)) {
             message(self.window, "条目已变化", "注册表条目内容已变化，请刷新列表。", 0x30);
             return false;
         }
         let entries = self.entries.clone();
         let mut candidates = removal_candidates(entry, &entries);
-        let registration = candidates.pop().filter(RemovalTarget::exists);
         candidates.retain(RemovalTarget::exists);
-        if let Some(target) = registration { candidates.push(target); }
         if candidates.is_empty() {
             message(self.window, "扫描完成", "未发现可安全归属此应用的残留项。", 0x40);
             return false;
         }
-        for (page, group) in candidates.chunks(8).enumerate() {
-            let list = group.iter().map(RemovalTarget::description).collect::<Vec<_>>().join("\n");
-            let prompt = format!("应用：{}\n候选项第 {} 页，共 {} 页\n\n{}\n\n请核对路径；取消不会删除任何内容。",
-                entry.name, page + 1, candidates.len().div_ceil(8), list);
-            if message(self.window, "残留检测结果", &prompt, 0x31) != 1 { return false; }
-        }
+        let selected = choose_removals(self.window, entry, &candidates);
+        if selected.is_empty() { return false; }
+        candidates = selected.into_iter().map(|index| candidates[index].clone()).collect();
         let prompt = format!("已预览 {} 个候选项。将永久删除所列文件、设置和注册表项，无法恢复。\n\n确认清理“{}”吗？",
             candidates.len(), entry.name);
         if message(self.window, "确认清理", &prompt, 0x24) != 6 { return false; }
-        let current = open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some();
-        if (registered && !Self::entry_unchanged(entry)) || (!registered && current) {
+        let current = !store && open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some();
+        if (store && !store_family_absent(&entry.package_family))
+            || (!store && ((registered && !Self::entry_unchanged(entry)) || (!registered && current))) {
             message(self.window, "条目已变化", "注册表条目内容已变化，请刷新列表。", 0x30);
             return false;
         }
@@ -1585,20 +1816,28 @@ impl AppState {
 
     fn start_store_uninstalls(&mut self, entries: Vec<Entry>) {
         self.uninstalling = true;
+        self.sync_controls();
         self.set_status(&format!("正在逐个卸载 {} 个商店应用；期间不能删除其他应用。", entries.len()));
         let window = self.window;
         thread::spawn(move || {
-            let result: Result<(), String> = entries.into_iter().try_for_each(|entry| {
+            let mut completed = Vec::new();
+            let mut error = None;
+            for entry in entries {
                 let command = store_uninstall_command(&entry.package);
-                let status = Command::new("powershell.exe")
+                let result = Command::new("powershell.exe")
                     .args(["-NoProfile", "-NonInteractive", "-Command", &command])
                     .creation_flags(0x08000000).status()
-                    .map_err(|error| format!("{}：{error}", entry.name))?;
-                if status.success() { Ok(()) } else {
-                    Err(format!("{}：PowerShell 退出代码 {:?}", entry.name, status.code()))
+                    .map_err(|cause| format!("{}：{cause}", entry.name))
+                    .and_then(|status| if status.success() { Ok(()) } else {
+                        Err(format!("{}：PowerShell 退出代码 {:?}", entry.name, status.code()))
+                    });
+                if let Err(cause) = result {
+                    error = Some(cause);
+                    break;
                 }
-            });
-            let result = Box::into_raw(Box::new(result));
+                completed.push(entry);
+            }
+            let result = Box::into_raw(Box::new((completed, error)));
             if unsafe { PostMessageW(window, WM_APP_UNINSTALLED, 0, result as isize) } == 0 {
                 unsafe { drop(Box::from_raw(result)); }
             }
@@ -1620,33 +1859,33 @@ impl AppState {
             Ok(parts) => parts,
             Err(error) => { message(self.window, "无法启动卸载程序", &error, 0x10); return false; }
         };
-        let mut result = unsafe { ShellExecuteW(self.window, wide("open").as_ptr(), wide(&file).as_ptr(),
-            wide(&args).as_ptr(), null(), 1) };
-        if result == 5 {
-            result = unsafe { ShellExecuteW(self.window, wide("runas").as_ptr(), wide(&file).as_ptr(),
-                wide(&args).as_ptr(), null(), 1) };
+        if let Err(error) = wait_for_desktop_uninstall(self.window, entry, file, args) {
+            message(self.window, "卸载未完成", &error, 0x30);
+            self.refresh();
+            return false;
         }
-        if result <= 32 {
-            message(self.window, "无法启动卸载程序", &format!("ShellExecute 错误代码：{result}"), 0x10);
-            false
-        } else {
-            message(self.window, "卸载进行中", &format!(
-                "已启动“{}”的卸载程序。请完成或取消卸载流程后，再点击确定。期间不能删除其他应用。",
-                entry.name), 0x40);
-            let path = format!("{UNINSTALL_KEY}\\{}", entry.subkey);
-            if open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_none()
-                && message(self.window, "全面检测清除", &format!(
-                    "“{}”的卸载登记项已消失。是否扫描剩余文件、快捷方式和注册表项？扫描结果会在删除前展示。",
-                    entry.name), 0x24) == 6 {
-                self.scan_and_remove(entry, false);
-            }
-            true
+        if open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some() {
+            message(self.window, "卸载未确认完成", "卸载登记项仍然存在，未执行残留删除。", 0x30);
+            self.refresh();
+            return false;
         }
+        self.scan_and_remove(entry, false);
+        true
     }
 }
 
+fn ps_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "''")) }
+
 fn store_uninstall_command(package: &str) -> String {
-    format!("Remove-AppxPackage -Package '{}' -ErrorAction Stop", package.replace('\'', "''"))
+    format!("Remove-AppxPackage -Package {} -ErrorAction Stop", ps_quote(package))
+}
+
+fn store_family_absent(family: &str) -> bool {
+    if !single_key_component(family) { return false; }
+    let script = format!("$ErrorActionPreference='Stop'; if (Get-AppxPackage | Where-Object {{ $_.PackageFamilyName -eq {} }}) {{ exit 1 }}",
+        ps_quote(family));
+    Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(0x08000000).status().is_ok_and(|status| status.success())
 }
 
 impl Drop for AppState {
@@ -1732,11 +1971,15 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
             return 0;
         }
         WM_APP_UNINSTALLED => {
-            let result = *Box::from_raw(lparam as *mut Result<(), String>);
+            let (completed, error) = *Box::from_raw(lparam as *mut (Vec<Entry>, Option<String>));
             if !pointer.is_null() {
-                (*pointer).uninstalling = false;
-                (*pointer).refresh();
-                if let Err(error) = result { message(window, "卸载未完成", &error, 0x30); }
+                let state = &mut *pointer;
+                state.uninstalling = false;
+                state.deleting = true;
+                for entry in &completed { state.scan_and_remove(entry, false); }
+                state.deleting = false;
+                state.refresh();
+                if let Some(error) = error { message(window, "卸载未完成", &error, 0x30); }
             }
             return 0;
         }
