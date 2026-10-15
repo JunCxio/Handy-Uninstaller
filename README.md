@@ -14,6 +14,10 @@ cargo build --release
 
 应用图标已嵌入可执行文件。更换 `assets/app.ico` 后，先运行 `python tools/make_icon_object.py` 更新资源对象，再重新构建；`assets/app.svg` 是可编辑的原始图形。
 
+## 发布
+
+推送与 `Cargo.toml` 版本对应的 `v*` 标签后，GitHub Actions 会在 Windows x64 上运行测试、构建发布版本，并创建附有单个可执行文件的 GitHub Release。
+
 ## 功能范围
 
 - 枚举 HKLM、HKCU 的 64 位和 32 位卸载注册项，以及当前用户的商店应用；通过“桌面应用”和“商店应用”页签切换。

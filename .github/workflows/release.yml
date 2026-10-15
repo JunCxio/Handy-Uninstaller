@@ -1,0 +1,35 @@
+name: 发布 Windows 程序
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: 运行测试
+        run: cargo test --locked
+      - name: 构建程序
+        run: cargo build --release --locked
+      - name: 发布程序
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "Handy-Uninstaller-$env:GITHUB_REF_NAME-windows-x64.exe"
+          Copy-Item target/release/handy-uninstaller.exe $asset
+          if (gh release view $env:GITHUB_REF_NAME 2>$null) {
+            gh release upload $env:GITHUB_REF_NAME $asset --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME $asset --title "Handy Uninstaller $env:GITHUB_REF_NAME" --generate-notes
+          }
