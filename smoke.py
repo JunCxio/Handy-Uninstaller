@@ -27,6 +27,7 @@ user32.GetWindowTextW.restype = ctypes.c_int
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
 user32.MoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                               ctypes.c_int, ctypes.c_int, ctypes.c_int]
+user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.GetMenuItemCount.argtypes = [ctypes.c_void_p]
 user32.GetMenuStringW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_uint]
@@ -122,7 +123,17 @@ try:
     store_tab = user32.FindWindowExW(window, None, "Button", "商店应用")
     theme = user32.FindWindowExW(window, None, "Button", "深色模式") or user32.FindWindowExW(
         window, None, "Button", "浅色模式")
-    assert listing and search and desktop_tab and store_tab and theme, "列表、搜索框、页签或主题按钮缺失"
+    monitor = user32.FindWindowExW(window, None, "Button", "开始安装监控")
+    refresh = user32.FindWindowExW(window, None, "Button", "刷新")
+    assert listing and search and desktop_tab and store_tab and theme and monitor and refresh, "列表或操作按钮缺失"
+    positions = []
+    for control in (monitor, theme, refresh):
+        position = Rect()
+        assert user32.GetWindowRect(control, ctypes.byref(position))
+        positions.append(position)
+    assert positions[0].left < positions[1].left < positions[2].left, "操作按钮顺序不符"
+    assert positions[1].right - positions[1].left == 40, "主题按钮不是图标尺寸"
+    assert positions[2].right - positions[2].left == 40, "刷新按钮不是图标尺寸"
     assert not user32.FindWindowExW(window, None, "Button", "卸载所选应用"), "顶部卸载按钮仍存在"
     for _ in range(300):
         count = user32.SendMessageW(listing, 0x1004, 0, 0)
@@ -147,8 +158,6 @@ try:
             status = child
             break
     assert status, "状态栏缺失"
-    monitor = user32.FindWindowExW(window, None, "Button", "开始安装监控")
-    assert monitor, "安装监控按钮缺失"
     user32.SendMessageW(monitor, 0x00F5, 0, 0)
     monitor_text = ctypes.create_unicode_buffer(100)
     user32.GetWindowTextW(monitor, monitor_text, len(monitor_text))

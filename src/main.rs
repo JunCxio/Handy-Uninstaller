@@ -866,7 +866,7 @@ fn icon_for(entry: &Entry, gdiplus: Option<&GdiPlus>) -> Handle {
         if !Path::new(&path).is_file() { continue; }
         let (mut large, mut small) = (0, 0);
         let count = unsafe { ExtractIconExW(wide(&path).as_ptr(), index, &mut large, &mut small, 1) };
-        let icon = if count != 0 { if small != 0 { small } else { large } } else { 0 };
+        let icon = if count != 0 { if large != 0 { large } else { small } } else { 0 };
         unsafe {
             if large != 0 && large != icon { DestroyIcon(large); }
             if small != 0 && small != icon && small != large { DestroyIcon(small); }
@@ -880,6 +880,7 @@ struct AppState {
     window: Hwnd, search: Hwnd, refresh: Hwnd, monitor: Hwnd, theme: Hwnd,
     desktop_tab: Hwnd, store_tab: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
     title_font: Handle, body_font: Handle, small_font: Handle, bold_font: Handle, stat_font: Handle,
+    icon_font: Handle,
     edit_brush: Handle, status_brush: Handle, dark: bool, store_view: bool, search_placeholder: bool,
     entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
     deleting: bool, uninstalling: bool, sort_column: usize, sort_descending: bool,
@@ -892,9 +893,9 @@ impl AppState {
     fn new(window: Hwnd, instance: Handle) -> Self {
         let basic = WS_CHILD | WS_VISIBLE;
         let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL, 0, ID_SEARCH);
-        let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_REFRESH);
         let monitor = create_control(instance, window, "BUTTON", "开始安装监控", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_MONITOR);
         let theme = create_control(instance, window, "BUTTON", "", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_THEME);
+        let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_REFRESH);
         let desktop_tab = create_control(instance, window, "BUTTON", "桌面应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_DESKTOP_TAB);
         let store_tab = create_control(instance, window, "BUTTON", "商店应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_STORE_TAB);
         let list = create_control(instance, window, "SysListView32", "",
@@ -910,6 +911,8 @@ impl AppState {
             wide("Segoe UI").as_ptr()) };
         let stat_font = unsafe { CreateFontW(-26, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0,
             wide("Segoe UI").as_ptr()) };
+        let icon_font = unsafe { CreateFontW(-19, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+            wide("Segoe MDL2 Assets").as_ptr()) };
         for (control, font) in [(status, small_font), (search, body_font), (refresh, body_font),
             (monitor, body_font), (theme, body_font), (desktop_tab, bold_font),
             (store_tab, bold_font), (list, body_font)] {
@@ -922,12 +925,12 @@ impl AppState {
         add_column(list, 2, "发布者", 230);
         add_column(list, 3, "来源", 150);
         add_column(list, 4, "安装时间", 120);
-        let images = unsafe { ImageList_Create(20, 20, 0x21, 8, 16) };
+        let images = unsafe { ImageList_Create(24, 24, 0x21, 8, 16) };
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
         let dark = saved_dark_mode();
         let colors = palette(dark);
         let state = Self { window, search, refresh, monitor, theme, desktop_tab, store_tab, list, status, images,
-            title_font, body_font, small_font, bold_font, stat_font,
+            title_font, body_font, small_font, bold_font, stat_font, icon_font,
             edit_brush: unsafe { CreateSolidBrush(colors.input) },
             status_brush: unsafe { CreateSolidBrush(colors.chrome) }, dark, store_view: false,
             search_placeholder: true,
@@ -949,11 +952,11 @@ impl AppState {
         let height = rect.bottom.max(540);
         unsafe {
             MoveWindow(self.search, 72, 133, 338, 22, 1);
-            MoveWindow(self.theme, width - 374, 124, 103, 40, 1);
-            MoveWindow(self.monitor, width - 260, 124, 144, 40, 1);
-            MoveWindow(self.refresh, width - 105, 124, 73, 40, 1);
-            MoveWindow(self.desktop_tab, 32, 181, 112, 45, 1);
-            MoveWindow(self.store_tab, 148, 181, 112, 45, 1);
+            MoveWindow(self.monitor, width - 280, 124, 144, 40, 1);
+            MoveWindow(self.theme, width - 124, 124, 40, 40, 1);
+            MoveWindow(self.refresh, width - 72, 124, 40, 40, 1);
+            MoveWindow(self.desktop_tab, 32, 181, 96, 45, 1);
+            MoveWindow(self.store_tab, 136, 181, 96, 45, 1);
             MoveWindow(self.list, 32, 264, width - 64, height - 334, 1);
             MoveWindow(self.status, width * 38 / 100, height - 36,
                 width * 62 / 100 - 32, 20, 1);
@@ -1067,7 +1070,7 @@ impl AppState {
         fill(dc, Rect { left: 0, top: height - 70, right: width, bottom: height - 69 }, colors.line);
         if let Some(index) = self.selected() {
             let entry = &self.entries[index];
-            unsafe { ImageList_Draw(self.images, entry.image, dc, 34, height - 46, 1); }
+            unsafe { ImageList_Draw(self.images, entry.image, dc, 32, height - 48, 1); }
             draw_text(dc, &entry.name, Rect { left: 78, top: height - 62,
                 right: width * 38 / 100 - 16, bottom: height - 38 },
                 self.bold_font, colors.text, 0x20 | 0x4 | 0x8000);
@@ -1090,14 +1093,17 @@ impl AppState {
         if id == ID_DESKTOP_TAB || id == ID_STORE_TAB {
             let active = (id == ID_STORE_TAB) == self.store_view;
             fill(item.dc, item.rect, colors.background);
-            let count = self.entries.iter().filter(|entry|
-                in_view(&entry.package, id == ID_STORE_TAB)).count();
-            let label = format!("{}  {count}", if id == ID_STORE_TAB { "商店应用" } else { "桌面应用" });
-            draw_text(item.dc, &label, item.rect, self.bold_font,
-                if active { colors.accent } else { colors.muted }, 0x20 | 0x4 | 0x1);
+            let label = if id == ID_STORE_TAB { "商店应用" } else { "桌面应用" };
+            draw_text(item.dc, label, Rect { right: item.rect.left + 66, ..item.rect },
+                self.small_font, if active { colors.accent } else { colors.muted }, 0x20 | 0x4);
             if active {
+                let count = self.entries.iter().filter(|entry|
+                    in_view(&entry.package, id == ID_STORE_TAB)).count();
+                draw_text(item.dc, &count.to_string(), Rect { left: item.rect.left + 70, ..item.rect },
+                    self.small_font, if self.dark { color(139, 188, 249) } else { color(91, 150, 226) },
+                    0x20 | 0x4);
                 fill(item.dc, Rect { left: item.rect.left, top: item.rect.bottom - 3,
-                    right: item.rect.right, bottom: item.rect.bottom }, colors.accent);
+                    right: item.rect.left + 82, bottom: item.rect.bottom }, colors.accent);
             }
             return;
         }
@@ -1108,9 +1114,15 @@ impl AppState {
         rounded(item.dc, Rect { left: item.rect.left + 1, top: item.rect.top + 1,
             right: item.rect.right - 1, bottom: item.rect.bottom - 1 }, background,
             if primary { background } else { colors.line }, 10);
-        draw_text(item.dc, &window_text(item.window), item.rect, self.bold_font,
-            if disabled { colors.muted } else if primary { color(255, 255, 255) } else { colors.text },
-            0x20 | 0x4 | 0x1);
+        let ink = if disabled { colors.muted } else if primary { color(255, 255, 255) } else { colors.text };
+        if id == ID_THEME || id == ID_REFRESH {
+            let symbol = if id == ID_REFRESH { "\u{E895}" }
+                else if self.dark { "\u{E706}" } else { "\u{E708}" };
+            draw_text(item.dc, symbol, item.rect, self.icon_font, ink, 0x20 | 0x4 | 0x1);
+        } else {
+            draw_text(item.dc, &window_text(item.window), item.rect, self.bold_font, ink,
+                0x20 | 0x4 | 0x1);
+        }
     }
 
     fn draw_row(&self, item: &DrawItem) {
@@ -1122,7 +1134,7 @@ impl AppState {
         fill(item.dc, Rect { left: item.rect.left, top: item.rect.bottom - 1,
             right: item.rect.right, bottom: item.rect.bottom }, colors.line);
         unsafe { ImageList_Draw(self.images, entry.image, item.dc,
-            item.rect.left + 16, item.rect.top + (item.rect.bottom - item.rect.top - 20) / 2, 1); }
+            item.rect.left + 16, item.rect.top + (item.rect.bottom - item.rect.top - 24) / 2, 1); }
         let widths: [i32; 5] = std::array::from_fn(|column|
             unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, column, 0) as i32 });
         draw_text(item.dc, &entry.name, Rect { left: item.rect.left + 52, top: item.rect.top,
@@ -1642,7 +1654,7 @@ impl Drop for AppState {
         unsafe {
             if self.images != 0 { ImageList_Destroy(self.images); }
             for object in [self.title_font, self.body_font, self.small_font,
-                self.bold_font, self.stat_font, self.edit_brush, self.status_brush] {
+                self.bold_font, self.stat_font, self.icon_font, self.edit_brush, self.status_brush] {
                 if object != 0 { DeleteObject(object); }
             }
         }
