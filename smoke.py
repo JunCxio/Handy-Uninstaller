@@ -126,16 +126,19 @@ try:
     theme = user32.FindWindowExW(window, None, "Button", "深色模式") or user32.FindWindowExW(
         window, None, "Button", "浅色模式")
     refresh = user32.FindWindowExW(window, None, "Button", "刷新")
-    assert listing and search and desktop_tab and store_tab and theme and refresh, "列表或操作按钮缺失"
+    history = user32.FindWindowExW(window, None, "Button", "操作记录")
+    undo = user32.FindWindowExW(window, None, "Button", "撤销清理")
+    assert listing and search and desktop_tab and store_tab and theme and refresh and history and undo, "列表或操作按钮缺失"
+    assert not user32.IsWindowEnabled(undo), "没有清理记录时撤销按钮应禁用"
     assert not user32.FindWindowExW(window, None, "Button", "开始安装监控"), "安装监控按钮仍存在"
     positions = []
-    for control in (theme, refresh):
+    for control in (undo, history, theme, refresh):
         position = Rect()
         assert user32.GetWindowRect(control, ctypes.byref(position))
         positions.append(position)
-    assert positions[0].left < positions[1].left, "操作按钮顺序不符"
-    assert positions[0].right - positions[0].left == 40, "主题按钮不是图标尺寸"
-    assert positions[1].right - positions[1].left == 40, "刷新按钮不是图标尺寸"
+    assert all(left.left < right.left for left, right in zip(positions, positions[1:])), "操作按钮顺序不符"
+    assert positions[2].right - positions[2].left == 40, "主题按钮不是图标尺寸"
+    assert positions[3].right - positions[3].left == 40, "刷新按钮不是图标尺寸"
     assert not user32.FindWindowExW(window, None, "Button", "卸载所选应用"), "顶部卸载按钮仍存在"
     for _ in range(300):
         count = user32.SendMessageW(listing, 0x1004, 0, 0)

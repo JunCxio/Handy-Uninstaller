@@ -2,7 +2,8 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr::{null, null_mut};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Handle = isize;
 type Hwnd = Handle;
@@ -78,6 +79,8 @@ const ID_DESKTOP_TAB: usize = 103;
 const ID_STORE_TAB: usize = 104;
 const ID_THEME: usize = 105;
 const ID_LIST: usize = 106;
+const ID_HISTORY: usize = 107;
+const ID_UNDO: usize = 108;
 const MENU_UNINSTALL: u32 = 201;
 const MENU_FORCE_REMOVE: u32 = 202;
 const MENU_REMOVE_ENTRY: u32 = 203;
@@ -90,6 +93,9 @@ const ID_REMOVE_CANCEL: usize = 302;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Point { x: i32, y: i32 }
+#[repr(C)]
+struct LocalTime { year: u16, month: u16, day_of_week: u16, day: u16,
+    hour: u16, minute: u16, second: u16, milliseconds: u16 }
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
@@ -141,6 +147,8 @@ extern "system" {
     fn RegOpenKeyExW(key: Hkey, subkey: *const u16, options: u32, access: u32, result: *mut Hkey) -> i32;
     fn RegEnumKeyExW(key: Hkey, index: u32, name: *mut u16, len: *mut u32,
         reserved: *mut u32, class: *mut u16, class_len: *mut u32, time: *mut c_void) -> i32;
+    fn RegEnumValueW(key: Hkey, index: u32, name: *mut u16, name_len: *mut u32,
+        reserved: *mut u32, kind: *mut u32, data: *mut u8, data_len: *mut u32) -> i32;
     fn RegQueryValueExW(key: Hkey, name: *const u16, reserved: *mut u32,
         kind: *mut u32, data: *mut u8, len: *mut u32) -> i32;
     fn RegCloseKey(key: Hkey) -> i32;
@@ -159,6 +167,8 @@ extern "system" {
     fn LoadLibraryW(name: *const u16) -> Handle;
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     fn FreeLibrary(module: Handle) -> i32;
+    fn GetLocalTime(time: *mut LocalTime);
+    fn MoveFileW(existing: *const u16, destination: *const u16) -> i32;
 }
 #[link(name = "user32")]
 extern "system" {
@@ -409,6 +419,30 @@ fn open_key(root: Hkey, path: &str, view: u32, access: u32) -> Option<Key> {
     let mut key = 0;
     let status = unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, access | view, &mut key) };
     (status == 0).then_some(Key(key))
+}
+
+fn open_key_without_links(root: Hkey, path: &str, view: u32, access: u32) -> Result<Key, String> {
+    let parts: Vec<_> = path.split('\\').collect();
+    if parts.iter().any(|part| !single_key_component(part)) {
+        return Err("注册表路径包含无效组件".into());
+    }
+    let mut current: Option<Key> = None;
+    for (index, part) in parts.iter().enumerate() {
+        let base = current.as_ref().map_or(root, |key| key.0);
+        let rights = if index + 1 == parts.len() { access } else { KEY_READ };
+        let mut handle = 0;
+        let status = unsafe { RegOpenKeyExW(base, wide(part).as_ptr(), 8,
+            rights | if index == 0 { view } else { 0 }, &mut handle) };
+        if status != 0 { return Err(format!("无法打开注册表路径：{status}")); }
+        let key = Key(handle);
+        let mut kind = 0;
+        let mut len = 0;
+        let status = unsafe { RegQueryValueExW(key.0, wide("SymbolicLinkValue").as_ptr(),
+            null_mut(), &mut kind, null_mut(), &mut len) };
+        if status == 0 && kind == 6 { return Err("注册表路径包含符号链接".into()); }
+        current = Some(key);
+    }
+    current.ok_or_else(|| "注册表路径为空".into())
 }
 
 fn value(key: Hkey, name: &str) -> Option<(u32, Vec<u8>)> {
@@ -699,6 +733,22 @@ impl RemovalTarget {
         }
     }
 
+    fn reason(&self, entry: &Entry) -> &'static str {
+        match self {
+            Self::Shortcut(_) => "目标位于该应用安装目录",
+            Self::Directory(_) if !entry.package.is_empty() => "目录名与包系列名完全一致",
+            Self::Directory(path) if install_folder(entry).is_some_and(|folder|
+                Path::new(&folder).canonicalize().ok().as_deref() == Some(path)) =>
+                "安装位置或图标指向此目录；未共用",
+            Self::Directory(_) => "目录名等于应用名；未共用",
+            Self::Registry { parent, .. } if parent == UNINSTALL_KEY =>
+                "卸载登记项；其他项目清理后删除",
+            Self::Registry { .. } if !entry.package.is_empty() =>
+                "键名与包标识完全一致",
+            Self::Registry { .. } => "发布者与应用名精确匹配",
+        }
+    }
+
     fn delete(&self) -> Result<(), String> {
         match self {
             Self::Directory(path) => {
@@ -707,12 +757,344 @@ impl RemovalTarget {
             }
             Self::Shortcut(path) => std::fs::remove_file(path).map_err(|error| error.to_string()),
             Self::Registry { machine, view, parent, name } => {
-                let key = open_key(hive(*machine), parent, *view, KEY_READ | KEY_WRITE | 0x10000)
-                    .ok_or_else(|| "无法写入注册表，请以管理员身份运行后重试".to_owned())?;
+                let key = open_key_without_links(hive(*machine), parent, *view,
+                    KEY_READ | KEY_WRITE | 0x10000)?;
                 let status = unsafe { RegDeleteTreeW(key.0, wide(name).as_ptr()) };
                 if status == 0 { Ok(()) } else { Err(format!("注册表错误代码：{status}")) }
             }
         }
+    }
+}
+
+struct RegistryValue { name: String, kind: u32, data: Vec<u8> }
+struct RegistryBackup { values: Vec<RegistryValue>, children: Vec<(String, RegistryBackup)> }
+
+fn read_registry_tree(key: Hkey, depth: usize, budget: &mut usize) -> Result<RegistryBackup, String> {
+    if depth > 32 || *budget > 64 * 1024 * 1024 {
+        return Err("注册表项过深或过大，已停止清理".into());
+    }
+    *budget += 1024;
+    let mut backup = RegistryBackup { values: Vec::new(), children: Vec::new() };
+    let mut index = 0;
+    'values: loop {
+        let mut name = vec![0u16; 16384];
+        let mut data = vec![0u8; 4096];
+        let mut kind = 0;
+        loop {
+            let mut name_len = name.len() as u32;
+            let mut data_len = data.len() as u32;
+            let status = unsafe { RegEnumValueW(key, index, name.as_mut_ptr(), &mut name_len,
+                null_mut(), &mut kind, data.as_mut_ptr(), &mut data_len) };
+            if status == ERROR_NO_MORE_ITEMS { break 'values; }
+            if status == 234 && data_len as usize > data.len() && data_len <= 16 * 1024 * 1024 {
+                data.resize(data_len as usize, 0);
+                continue;
+            }
+            if status != 0 { return Err(format!("读取注册表值失败：{status}")); }
+            data.truncate(data_len as usize);
+            *budget += data.len() + name_len as usize * 2;
+            if *budget > 64 * 1024 * 1024 { return Err("注册表项过大，已停止清理".into()); }
+            backup.values.push(RegistryValue { name: from_wide(&name[..name_len as usize]), kind, data });
+            index += 1;
+            break;
+        }
+    }
+    let mut index = 0;
+    loop {
+        let mut name = vec![0u16; 32768];
+        let mut len = name.len() as u32;
+        let status = unsafe { RegEnumKeyExW(key, index, name.as_mut_ptr(), &mut len,
+            null_mut(), null_mut(), null_mut(), null_mut()) };
+        if status == ERROR_NO_MORE_ITEMS { break; }
+        if status != 0 { return Err(format!("读取注册表子项失败：{status}")); }
+        let name = from_wide(&name[..len as usize]);
+        let child = open_key_without_links(key, &name, 0, KEY_READ)?;
+        backup.children.push((name, read_registry_tree(child.0, depth + 1, budget)?));
+        index += 1;
+    }
+    Ok(backup)
+}
+
+fn registry_backup(target: &RemovalTarget) -> Result<RegistryBackup, String> {
+    let RemovalTarget::Registry { machine, view, parent, name } = target else {
+        return Err("目标不是注册表项".into());
+    };
+    if !single_key_component(name) { return Err("注册表项名称无效".into()); }
+    let path = format!("{parent}\\{name}");
+    let key = open_key_without_links(hive(*machine), &path, *view, KEY_READ)?;
+    read_registry_tree(key.0, 0, &mut 0)
+}
+
+fn write_registry_tree(key: Hkey, backup: &RegistryBackup) -> Result<(), String> {
+    for value in &backup.values {
+        let status = unsafe { RegSetValueExW(key, wide(&value.name).as_ptr(), 0, value.kind,
+            value.data.as_ptr(), value.data.len() as u32) };
+        if status != 0 { return Err(format!("恢复注册表值失败：{status}")); }
+    }
+    for (name, child) in &backup.children {
+        let mut handle = 0;
+        let mut disposition = 0;
+        let status = unsafe { RegCreateKeyExW(key, wide(name).as_ptr(), 0, null_mut(), 0,
+            KEY_WRITE, null(), &mut handle, &mut disposition) };
+        if status != 0 { return Err(format!("恢复注册表子项失败：{status}")); }
+        let handle = Key(handle);
+        if disposition != 1 { return Err("目标注册表子项已存在，已停止恢复".into()); }
+        write_registry_tree(handle.0, child)?;
+    }
+    Ok(())
+}
+
+fn restore_registry(target: &RemovalTarget, backup: &RegistryBackup) -> Result<(), String> {
+    let RemovalTarget::Registry { machine, view, parent, name } = target else {
+        return Err("目标不是注册表项".into());
+    };
+    let parent = open_key_without_links(hive(*machine), parent, *view, KEY_READ | KEY_WRITE)?;
+    let mut handle = 0;
+    let mut disposition = 0;
+    let status = unsafe { RegCreateKeyExW(parent.0, wide(name).as_ptr(), 0, null_mut(), 0,
+        KEY_WRITE, null(), &mut handle, &mut disposition) };
+    if status != 0 { return Err(format!("恢复注册表项失败：{status}")); }
+    let handle = Key(handle);
+    if disposition != 1 { return Err("目标注册表项已存在，已停止恢复".into()); }
+    write_registry_tree(handle.0, backup)
+}
+
+fn write_missing_registry_tree(key: Hkey, backup: &RegistryBackup) -> Result<(), String> {
+    for item in &backup.values {
+        let mut kind = 0;
+        let mut len = 0;
+        let status = unsafe { RegQueryValueExW(key, wide(&item.name).as_ptr(), null_mut(),
+            &mut kind, null_mut(), &mut len) };
+        if status == 0 {
+            if !value(key, &item.name).is_some_and(|(kind, data)| kind == item.kind && data == item.data) {
+                return Err(format!("注册表值“{}”已变化，未覆盖", item.name));
+            }
+        } else if status == 2 {
+            let status = unsafe { RegSetValueExW(key, wide(&item.name).as_ptr(), 0, item.kind,
+                item.data.as_ptr(), item.data.len() as u32) };
+            if status != 0 { return Err(format!("恢复注册表值失败：{status}")); }
+        } else { return Err(format!("复核注册表值失败：{status}")); }
+    }
+    for (name, child) in &backup.children {
+        let mut handle = 0;
+        let mut disposition = 0;
+        let status = unsafe { RegCreateKeyExW(key, wide(name).as_ptr(), 0, null_mut(), 0,
+            KEY_READ | KEY_WRITE, null(), &mut handle, &mut disposition) };
+        if status != 0 { return Err(format!("恢复注册表子项失败：{status}")); }
+        let handle = Key(handle);
+        if disposition == 1 { write_registry_tree(handle.0, child)?; }
+        else { write_missing_registry_tree(handle.0, child)?; }
+    }
+    Ok(())
+}
+
+fn restore_partial_registry(target: &RemovalTarget, backup: &RegistryBackup) -> Result<(), String> {
+    let RemovalTarget::Registry { machine, view, parent, name } = target else {
+        return Err("目标不是注册表项".into());
+    };
+    let parent = open_key_without_links(hive(*machine), parent, *view, KEY_READ | KEY_WRITE)?;
+    let mut handle = 0;
+    let mut disposition = 0;
+    let status = unsafe { RegCreateKeyExW(parent.0, wide(name).as_ptr(), 0, null_mut(), 0,
+        KEY_READ | KEY_WRITE, null(), &mut handle, &mut disposition) };
+    if status != 0 { return Err(format!("恢复注册表项失败：{status}")); }
+    let handle = Key(handle);
+    if disposition == 1 { write_registry_tree(handle.0, backup) }
+    else { write_missing_registry_tree(handle.0, backup) }
+}
+
+enum RecoveredItem {
+    Moved(RemovalTarget, PathBuf),
+    Registry(RemovalTarget, RegistryBackup, bool),
+}
+
+impl RecoveredItem {
+    fn target(&self) -> &RemovalTarget {
+        match self { Self::Moved(target, _) | Self::Registry(target, _, _) => target }
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        match self {
+            Self::Moved(target, stored) => {
+                let path = match target {
+                    RemovalTarget::Directory(path) | RemovalTarget::Shortcut(path) => path,
+                    _ => unreachable!(),
+                };
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err("原路径已被占用，未覆盖现有文件".into());
+                }
+                ensure_no_reparse_points(stored)
+                    .map_err(|error| format!("隔离项目不安全或不存在：{error}"))?;
+                ensure_no_reparse_ancestors(path.parent().unwrap())
+                    .map_err(|error| format!("原路径的父目录不安全：{error}"))?;
+                let status = unsafe { MoveFileW(wide(&stored.to_string_lossy()).as_ptr(),
+                    wide(&path.to_string_lossy()).as_ptr()) };
+                if status == 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok(()) }
+            }
+            Self::Registry(target, backup, partial) => {
+                if *partial { restore_partial_registry(target, backup) }
+                else { restore_registry(target, backup) }
+            }
+        }
+    }
+
+    fn discard(&self) -> Result<(), String> {
+        let Self::Moved(target, stored) = self else { return Ok(()); };
+        ensure_no_reparse_points(stored)
+            .map_err(|error| format!("{}：{error}", stored.display()))?;
+        match target {
+            RemovalTarget::Directory(_) => std::fs::remove_dir_all(stored),
+            RemovalTarget::Shortcut(_) => std::fs::remove_file(stored),
+            _ => unreachable!(),
+        }.map_err(|error| format!("{}：{error}", stored.display()))?;
+        std::fs::remove_file(stored.with_extension("txt"))
+            .map_err(|error| format!("隔离记录未删除：{error}"))
+    }
+}
+
+struct Recovery {
+    app: String,
+    id: String,
+    items: Vec<RecoveredItem>,
+    folders: HashSet<PathBuf>,
+}
+
+impl Recovery {
+    fn new(app: &str) -> Self {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        Self { app: app.into(), id: format!("{}-{stamp}", std::process::id()),
+            items: Vec::new(), folders: HashSet::new() }
+    }
+
+    fn archive(&mut self, target: &RemovalTarget) -> Result<(), String> {
+        match target {
+            RemovalTarget::Registry { .. } => {
+                let backup = registry_backup(target)?;
+                if let Err(error) = target.delete() {
+                    if let Err(restore_error) = restore_partial_registry(target, &backup) {
+                        self.items.push(RecoveredItem::Registry(target.clone(), backup, true));
+                        return Err(format!("{error}；自动恢复失败：{restore_error}"));
+                    }
+                    return Err(format!("{error}；已恢复删除前的键值"));
+                }
+                self.items.push(RecoveredItem::Registry(target.clone(), backup, false));
+            }
+            RemovalTarget::Directory(path) | RemovalTarget::Shortcut(path) => {
+                if !path.is_absolute() { return Err("候选路径不是绝对路径".into()); }
+                ensure_no_reparse_points(path).map_err(|error| error.to_string())?;
+                let parent = path.parent().ok_or("候选路径没有父目录")?;
+                let root = parent.join(".Handy-Uninstaller-Recovery");
+                if !root.exists() { std::fs::create_dir(&root).map_err(|error| error.to_string())?; }
+                if std::fs::symlink_metadata(&root).map_err(|error| error.to_string())?
+                    .file_attributes() & 0x400 != 0 { return Err("隔离目录是重解析点".into()); }
+                let folder = root.join(&self.id);
+                if !self.folders.contains(&folder) {
+                    std::fs::create_dir(&folder).map_err(|error| error.to_string())?;
+                    self.folders.insert(folder.clone());
+                }
+                let stored = folder.join(self.items.len().to_string());
+                let marker = stored.with_extension("txt");
+                let mut file = OpenOptions::new().create_new(true).write(true).open(&marker)
+                    .map_err(|error| format!("无法记录隔离位置：{error}"))?;
+                let saved = file.write_all(path.to_string_lossy().as_bytes()).and_then(|()| file.sync_all());
+                drop(file);
+                if let Err(error) = saved {
+                    let _ = std::fs::remove_file(&marker);
+                    return Err(format!("无法保存隔离位置：{error}"));
+                }
+                let status = unsafe { MoveFileW(wide(&path.to_string_lossy()).as_ptr(),
+                    wide(&stored.to_string_lossy()).as_ptr()) };
+                if status == 0 {
+                    let _ = std::fs::remove_file(marker);
+                    return Err(format!("无法隔离候选项：{}", std::io::Error::last_os_error()));
+                }
+                self.items.push(RecoveredItem::Moved(target.clone(), stored));
+            }
+        }
+        Ok(())
+    }
+
+    fn undo(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut restore_failed = false;
+        let mut index = 0;
+        while index < self.items.len() {
+            let item = &self.items[index];
+            let target = item.target();
+            if restore_failed && matches!(target,
+                RemovalTarget::Registry { parent, .. } if parent == UNINSTALL_KEY) {
+                errors.push("其他项目未恢复，卸载登记项暂不恢复".into());
+                index += 1;
+                continue;
+            }
+            let result = item.restore();
+            let detail = match &result { Ok(()) => "已恢复".to_owned(), Err(error) => error.clone() };
+            if let Err(error) = log_operation("撤销清理", &self.app,
+                &format!("{}：{detail}", target.description())) {
+                errors.push(error);
+            }
+            match result {
+                Ok(()) => {
+                    if let RecoveredItem::Moved(_, stored) = item {
+                        if let Err(error) = std::fs::remove_file(stored.with_extension("txt")) {
+                            errors.push(format!("隔离记录未删除：{error}"));
+                        }
+                    }
+                    self.items.remove(index);
+                }
+                Err(error) => {
+                    restore_failed = true;
+                    errors.push(format!("{}：{error}", target.description()));
+                    index += 1;
+                }
+            }
+        }
+        if self.items.is_empty() {
+            self.remove_empty_folders();
+        }
+        errors
+    }
+
+    fn finalize(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for item in &self.items {
+            let detail = item.target().description();
+            if let Err(error) = item.discard() {
+                errors.push(format!("{detail}：{error}"));
+            } else if let Err(error) = log_operation("最终清理隔离项", &self.app, &detail) {
+                errors.push(error);
+            }
+        }
+        self.remove_empty_folders();
+        errors
+    }
+
+    fn remove_empty_folders(&self) {
+        for folder in &self.folders {
+            let _ = std::fs::remove_dir(folder);
+            if let Some(root) = folder.parent() { let _ = std::fs::remove_dir(root); }
+        }
+    }
+}
+
+fn archive_with_log(recovery: &mut Recovery, target: &RemovalTarget) -> Result<(), String> {
+    let description = target.description();
+    log_operation("开始清理项目", &recovery.app, &description)?;
+    let result = recovery.archive(target);
+    let detail = match &result {
+        Ok(()) => match recovery.items.last() {
+            Some(RecoveredItem::Moved(_, stored)) =>
+                format!("{description}：已隔离至 {}", stored.display()),
+            _ => format!("{description}：已备份注册表键值"),
+        },
+        Err(error) => format!("{description}：{error}"),
+    };
+    let logged = log_operation("清理项目结果", &recovery.app, &detail);
+    match (result, logged) {
+        (Err(error), Err(log_error)) => Err(format!("{error}；{log_error}")),
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -722,17 +1104,57 @@ fn display_path(path: &Path) -> String {
     else { text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned() }
 }
 
+fn app_data_dir() -> Result<PathBuf, String> {
+    let root = std::env::var_os("LOCALAPPDATA").ok_or("无法定位当前用户的数据目录")?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() { return Err("当前用户的数据目录不是绝对路径".into()); }
+    let folder = root.join("HandyUninstaller");
+    std::fs::create_dir_all(&folder).map_err(|error| format!("无法创建操作记录目录：{error}"))?;
+    Ok(folder)
+}
+
+fn log_path() -> Result<PathBuf, String> { Ok(app_data_dir()?.join("operations.tsv")) }
+
+fn log_field(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\t', "\\t").replace('\r', "\\r").replace('\n', "\\n")
+}
+
+fn append_log(path: &Path, action: &str, app: &str, result: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)
+        .map_err(|error| format!("无法写入操作记录：{error}"))?;
+    if file.metadata().map_err(|error| error.to_string())?.len() == 0 {
+        file.write_all("时间\t操作\t应用\t结果\r\n".as_bytes()).map_err(|error| error.to_string())?;
+    }
+    let mut now = LocalTime { year: 0, month: 0, day_of_week: 0, day: 0,
+        hour: 0, minute: 0, second: 0, milliseconds: 0 };
+    unsafe { GetLocalTime(&mut now); }
+    let line = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}\t{}\t{}\t{}\r\n",
+        now.year, now.month, now.day, now.hour, now.minute, now.second,
+        log_field(action), log_field(app), log_field(result));
+    file.write_all(line.as_bytes()).and_then(|()| file.sync_data())
+        .map_err(|error| format!("无法保存操作记录：{error}"))
+}
+
+fn log_operation(action: &str, app: &str, result: &str) -> Result<(), String> {
+    append_log(&log_path()?, action, app, result)
+}
+
 fn single_key_component(name: &str) -> bool {
     !name.is_empty() && !name.contains(['\\', '/', '\0']) && name != "." && name != ".."
 }
 
-fn ensure_no_reparse_points(path: &Path) -> std::io::Result<()> {
+fn ensure_no_reparse_ancestors(path: &Path) -> std::io::Result<()> {
     for ancestor in path.ancestors() {
         if ancestor.as_os_str().is_empty() { break; }
         if std::fs::symlink_metadata(ancestor)?.file_attributes() & 0x400 != 0 {
             return Err(std::io::Error::other(format!("路径包含重解析点：{}", ancestor.display())));
         }
     }
+    Ok(())
+}
+
+fn ensure_no_reparse_points(path: &Path) -> std::io::Result<()> {
+    ensure_no_reparse_ancestors(path)?;
     let mut pending = vec![path.to_path_buf()];
     while let Some(next) = pending.pop() {
         let metadata = std::fs::symlink_metadata(&next)?;
@@ -972,6 +1394,72 @@ mod tests {
         assert!(store_data_directory(&invalid, &[invalid.clone()], &store_root).is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test] fn recovery_preserves_files_and_registry_values() {
+        let mut recovery = Recovery::new("测试应用");
+        let root = std::env::temp_dir().join(format!("handy-recovery-test-{}", recovery.id));
+        let folder = root.join("Demo");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("settings.txt"), b"original").unwrap();
+        recovery.archive(&RemovalTarget::Directory(folder.clone())).unwrap();
+        assert!(!folder.exists());
+        std::fs::create_dir(&folder).unwrap();
+        assert!(recovery.items[0].restore().is_err());
+        std::fs::remove_dir(&folder).unwrap();
+        recovery.items[0].restore().unwrap();
+        assert_eq!(std::fs::read(folder.join("settings.txt")).unwrap(), b"original");
+        let discard = root.join("Discard");
+        std::fs::create_dir(&discard).unwrap();
+        std::fs::write(discard.join("old.txt"), b"old").unwrap();
+        let mut second = Recovery::new("测试清理");
+        second.archive(&RemovalTarget::Directory(discard.clone())).unwrap();
+        second.items[0].discard().unwrap();
+        assert!(!discard.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let target = RemovalTarget::Registry { machine: false, view: VIEW_64,
+            parent: "SOFTWARE\\HandyUninstaller".into(), name: format!("RecoveryTest-{}", recovery.id) };
+        struct RegistryCleanup(RemovalTarget);
+        impl Drop for RegistryCleanup { fn drop(&mut self) { let _ = self.0.delete(); } }
+        let _cleanup = RegistryCleanup(target.clone());
+        let RemovalTarget::Registry { parent, name, .. } = &target else { unreachable!() };
+        let mut handle = 0;
+        let mut disposition = 0;
+        let status = unsafe { RegCreateKeyExW(hive(false), wide(&format!("{parent}\\{name}")).as_ptr(),
+            0, null_mut(), 0, KEY_READ | KEY_WRITE | VIEW_64, null(), &mut handle, &mut disposition) };
+        if status == 5 { eprintln!("注册表恢复测试因当前运行环境拒绝写入 HKCU 而跳过"); return; }
+        assert_eq!(status, 0);
+        assert_eq!(disposition, 1);
+        let key = Key(handle);
+        let content = wide("测试内容");
+        assert_eq!(unsafe { RegSetValueExW(key.0, wide("Text").as_ptr(), 0, REG_SZ,
+            content.as_ptr() as *const u8, (content.len() * 2) as u32) }, 0);
+        let mut child = 0;
+        assert_eq!(unsafe { RegCreateKeyExW(key.0, wide("Child").as_ptr(), 0, null_mut(), 0,
+            KEY_WRITE, null(), &mut child, null_mut()) }, 0);
+        let child = Key(child);
+        assert_eq!(unsafe { RegSetValueExW(child.0, wide("Binary").as_ptr(), 0, 3,
+            [1u8, 2, 3].as_ptr(), 3) }, 0);
+        drop(child);
+        drop(key);
+        let backup = registry_backup(&target).unwrap();
+        target.delete().unwrap();
+        assert!(!target.exists());
+        restore_registry(&target, &backup).unwrap();
+        let key = open_key(hive(false), &format!("{parent}\\{name}"), VIEW_64, KEY_READ).unwrap();
+        assert_eq!(text_value(key.0, "Text"), "测试内容");
+        let child = open_key(key.0, "Child", 0, KEY_READ).unwrap();
+        assert_eq!(value(child.0, "Binary").unwrap(), (3, vec![1, 2, 3]));
+    }
+
+    #[test] fn operation_log_escapes_user_text() {
+        let path = std::env::temp_dir().join(format!("handy-operation-log-{}.tsv", std::process::id()));
+        append_log(&path, "清理", "名称\t第二行\n", "文件：C:\\Demo\\app.exe").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("时间\t操作\t应用\t结果\r\n"));
+        assert!(text.contains("\t清理\t名称\\t第二行\\n\t文件：C:\\\\Demo\\\\app.exe\r\n"));
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 fn message(window: Hwnd, title: &str, text: &str, flags: u32) -> i32 {
@@ -1028,10 +1516,9 @@ fn choose_removals(owner: Hwnd, entry: &Entry, candidates: &[RemovalTarget]) -> 
         let list = create_control(instance, dialog, "SysListView32", "",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 0x200, 0);
         MoveWindow(list, 20, 52, 774, 365, 1);
-        SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0x424, 0x424);
-        let column_width = candidates.iter().map(|target| target.description().chars().count() as i32 * 10)
-            .max().unwrap_or(745).clamp(745, 6000);
-        add_column(list, 0, "勾选要删除的文件、快捷方式或注册表项", column_width);
+        SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0x4424, 0x4424);
+        add_column(list, 0, "候选项", 475);
+        add_column(list, 1, "匹配依据", 270);
         for (index, candidate) in candidates.iter().enumerate() {
             let mut description = wide(&candidate.description());
             let mut item: LvItem = zeroed();
@@ -1039,6 +1526,10 @@ fn choose_removals(owner: Hwnd, entry: &Entry, candidates: &[RemovalTarget]) -> 
             item.item = index as i32;
             item.text = description.as_mut_ptr();
             SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const _ as isize);
+            let mut reason = wide(candidate.reason(entry));
+            item.subitem = 1;
+            item.text = reason.as_mut_ptr();
+            SendMessageW(list, LVM_SETITEMTEXTW, index, &item as *const _ as isize);
             item.state = 0x2000;
             item.state_mask = 0xf000;
             SendMessageW(list, LVM_SETITEMSTATE, index, &item as *const _ as isize);
@@ -1199,7 +1690,7 @@ fn icon_for(entry: &Entry, gdiplus: Option<&GdiPlus>) -> Handle {
 }
 
 struct AppState {
-    window: Hwnd, search: Hwnd, refresh: Hwnd, theme: Hwnd,
+    window: Hwnd, search: Hwnd, refresh: Hwnd, theme: Hwnd, history: Hwnd, undo: Hwnd,
     desktop_tab: Hwnd, store_tab: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
     title_font: Handle, body_font: Handle, small_font: Handle, bold_font: Handle, stat_font: Handle,
     icon_font: Handle,
@@ -1207,6 +1698,7 @@ struct AppState {
     dark: bool, store_view: bool, search_placeholder: bool,
     entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
     deleting: bool, uninstalling: bool, sort_column: usize, sort_descending: bool,
+    recoveries: Vec<Recovery>,
 }
 
 impl AppState {
@@ -1215,6 +1707,8 @@ impl AppState {
         let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL, 0, ID_SEARCH);
         let theme = create_control(instance, window, "BUTTON", "", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_THEME);
         let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_REFRESH);
+        let history = create_control(instance, window, "BUTTON", "操作记录", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_HISTORY);
+        let undo = create_control(instance, window, "BUTTON", "撤销清理", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_UNDO);
         let desktop_tab = create_control(instance, window, "BUTTON", "桌面应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_DESKTOP_TAB);
         let store_tab = create_control(instance, window, "BUTTON", "商店应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_STORE_TAB);
         let list = create_control(instance, window, "SysListView32", "",
@@ -1233,7 +1727,7 @@ impl AppState {
         let icon_font = unsafe { CreateFontW(-19, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
             wide("Segoe MDL2 Assets").as_ptr()) };
         for (control, font) in [(status, small_font), (search, body_font), (refresh, body_font),
-            (theme, body_font), (desktop_tab, bold_font),
+            (theme, body_font), (history, body_font), (undo, body_font), (desktop_tab, bold_font),
             (store_tab, bold_font), (list, body_font)] {
             unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1); }
         }
@@ -1248,19 +1742,21 @@ impl AppState {
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
         let dark = saved_dark_mode();
         let colors = palette(dark);
-        let state = Self { window, search, refresh, theme, desktop_tab, store_tab, list, status, images,
+        let state = Self { window, search, refresh, theme, history, undo, desktop_tab, store_tab, list, status, images,
             title_font, body_font, small_font, bold_font, stat_font, icon_font,
             edit_brush: unsafe { CreateSolidBrush(colors.input) },
             inactive_brush: unsafe { CreateSolidBrush(colors.inactive_input) },
             status_brush: unsafe { CreateSolidBrush(colors.chrome) }, dark, store_view: false,
             search_placeholder: true,
             entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false,
-            deleting: false, uninstalling: false, sort_column: 0, sort_descending: false };
+            deleting: false, uninstalling: false, sort_column: 0, sort_descending: false,
+            recoveries: Vec::new() };
         set_title_dark(window, dark);
         for control in [search, list] { set_control_theme(control, dark); }
         state.color_list();
         unsafe { SetWindowTextW(theme, wide(if dark { "浅色模式" } else { "深色模式" }).as_ptr()); }
         state.layout();
+        state.sync_controls();
         state
     }
 
@@ -1271,6 +1767,8 @@ impl AppState {
         let height = rect.bottom.max(540);
         unsafe {
             MoveWindow(self.search, 72, 133, 338, 22, 1);
+            MoveWindow(self.undo, width - 366, 124, 106, 40, 1);
+            MoveWindow(self.history, width - 248, 124, 112, 40, 1);
             MoveWindow(self.theme, width - 124, 124, 40, 40, 1);
             MoveWindow(self.refresh, width - 72, 124, 40, 40, 1);
             MoveWindow(self.desktop_tab, 32, 181, 96, 45, 1);
@@ -1332,7 +1830,7 @@ impl AppState {
             self.inactive_brush = CreateSolidBrush(colors.inactive_input);
             self.status_brush = CreateSolidBrush(colors.chrome);
             SetWindowTextW(self.theme, wide(if self.dark { "浅色模式" } else { "深色模式" }).as_ptr());
-            for control in [self.window, self.search, self.refresh,
+            for control in [self.window, self.search, self.refresh, self.history, self.undo,
                 self.theme, self.desktop_tab, self.store_tab, self.list, self.status] {
                 InvalidateRect(control, null(), 1);
             }
@@ -1572,9 +2070,10 @@ impl AppState {
     fn sync_controls(&self) {
         let enabled = i32::from(!self.deleting && !self.uninstalling && !self.loading);
         for control in [self.list, self.search, self.desktop_tab, self.store_tab,
-            self.refresh] {
+            self.refresh, self.history] {
             unsafe { EnableWindow(control, enabled); }
         }
+        unsafe { EnableWindow(self.undo, i32::from(enabled != 0 && !self.recoveries.is_empty())); }
         unsafe { InvalidateRect(self.window, null(), 0); InvalidateRect(self.list, null(), 0); }
     }
 
@@ -1649,6 +2148,68 @@ impl AppState {
         }
     }
 
+    fn open_history(&self) {
+        let path = match log_path() {
+            Ok(path) => path,
+            Err(error) => { message(self.window, "无法打开操作记录", &error, 0x10); return; }
+        };
+        if !path.exists() {
+            if let Err(error) = std::fs::write(&path, "时间\t操作\t应用\t结果\r\n") {
+                message(self.window, "无法打开操作记录", &error.to_string(), 0x10);
+                return;
+            }
+        }
+        let notepad = match system_directory() {
+            Ok(path) => path.join("notepad.exe"),
+            Err(error) => { message(self.window, "无法打开操作记录", &error, 0x10); return; }
+        };
+        let result = unsafe { ShellExecuteW(self.window, wide("open").as_ptr(),
+            wide(&notepad.to_string_lossy()).as_ptr(),
+            wide(&format!("\"{}\"", path.display())).as_ptr(), null(), 1) };
+        if result <= 32 {
+            message(self.window, "无法打开操作记录", &format!("ShellExecute 错误代码：{result}"), 0x10);
+        }
+    }
+
+    fn undo_last(&mut self) {
+        if self.loading || self.deleting || self.uninstalling { return; }
+        let Some(mut recovery) = self.recoveries.pop() else { return; };
+        if let Err(error) = log_operation("开始撤销清理", &recovery.app,
+            &format!("{} 个项目", recovery.items.len())) {
+            self.recoveries.push(recovery);
+            message(self.window, "无法记录撤销操作", &error, 0x10);
+            return;
+        }
+        self.deleting = true;
+        self.sync_controls();
+        let errors = recovery.undo();
+        if !recovery.items.is_empty() { self.recoveries.push(recovery); }
+        self.deleting = false;
+        self.refresh();
+        if errors.is_empty() {
+            message(self.window, "撤销完成", "已恢复上次清理的项目。", 0x40);
+        } else {
+            message(self.window, "部分项目未恢复", &errors.join("\n"), 0x30);
+        }
+    }
+
+    fn confirm_close(&mut self) -> bool {
+        if self.recoveries.is_empty() { return true; }
+        if message(self.window, "确认关闭", &format!(
+            "仍有 {} 次清理可以撤销。关闭后将永久删除隔离的文件，注册表快照也将失效。\n\n确认关闭吗？",
+            self.recoveries.len()), 0x24) != 6 { return false; }
+        if let Err(error) = log_operation("放弃撤销", "", &format!("{} 次清理", self.recoveries.len())) {
+            message(self.window, "无法记录最终清理", &error, 0x10);
+            return false;
+        }
+        let mut errors = Vec::new();
+        for recovery in &mut self.recoveries { errors.extend(recovery.finalize()); }
+        if !errors.is_empty() {
+            message(self.window, "部分隔离项仍保留", &errors.join("\n"), 0x30);
+        }
+        true
+    }
+
     fn open_folder(&self) {
         let Some(index) = self.selected() else { return };
         let Some(path) = install_folder(&self.entries[index]) else {
@@ -1713,8 +2274,13 @@ impl AppState {
         }
         let target = RemovalTarget::Registry { machine: entry.machine, view: entry.view,
             parent: UNINSTALL_KEY.into(), name: entry.subkey };
-        match target.delete() {
-            Ok(()) => self.refresh(),
+        let mut recovery = Recovery::new(&entry.name);
+        let result = archive_with_log(&mut recovery, &target);
+        if !recovery.items.is_empty() { self.recoveries.push(recovery); self.refresh(); }
+        match result {
+            Ok(()) => {
+                message(self.window, "条目已删除", "本次运行期间可通过“撤销清理”恢复该条目。", 0x40);
+            }
             Err(error) => { message(self.window, "无法删除条目", &error, 0x10); }
         }
     }
@@ -1765,7 +2331,7 @@ impl AppState {
         let selected = choose_removals(self.window, entry, &candidates);
         if selected.is_empty() { return false; }
         candidates = selected.into_iter().map(|index| candidates[index].clone()).collect();
-        let prompt = format!("已预览 {} 个候选项。将永久删除所列文件、设置和注册表项，无法恢复。\n\n确认清理“{}”吗？",
+        let prompt = format!("已预览 {} 个候选项。将隔离所选文件并备份注册表键值；本次运行期间可撤销。第三方卸载程序的操作和注册表自定义权限不在恢复范围内。\n\n确认清理“{}”吗？",
             candidates.len(), entry.name);
         if message(self.window, "确认清理", &prompt, 0x24) != 6 { return false; }
         let current = !store && open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some();
@@ -1782,6 +2348,12 @@ impl AppState {
             }
         };
         let fresh = removal_candidates(entry, &fresh_entries);
+        if let Err(error) = log_operation("开始清理", &entry.name,
+            &format!("已确认 {} 个候选项", candidates.len())) {
+            message(self.window, "无法记录清理操作", &error, 0x10);
+            return false;
+        }
+        let mut recovery = Recovery::new(&entry.name);
         let mut errors = Vec::new();
         let registration = candidates.last().filter(|target| matches!(target,
             RemovalTarget::Registry { parent, .. } if parent == UNINSTALL_KEY));
@@ -1797,17 +2369,26 @@ impl AppState {
                     continue;
                 }
             }
-            if let Err(error) = candidate.delete() { errors.push(format!("{}：{error}", candidate.description())); }
+            if let Err(error) = archive_with_log(&mut recovery, candidate) {
+                errors.push(format!("{}：{error}", candidate.description()));
+                break;
+            }
         }
         if errors.is_empty() {
             if let Some(target) = registration {
                 if Self::entry_unchanged(entry) {
-                    if let Err(error) = target.delete() { errors.push(error); }
+                    if let Err(error) = archive_with_log(&mut recovery, target) { errors.push(error); }
                 } else { errors.push("卸载登记项已变化，已保留该条目".into()); }
             }
         }
+        let recovered = recovery.items.len();
+        if recovered != 0 { self.recoveries.push(recovery); }
+        if let Err(error) = log_operation("清理结果", &entry.name,
+            &format!("已隔离或备份 {recovered} 项；失败 {} 项：{}", errors.len(), errors.join("；"))) {
+            errors.push(error);
+        }
         if errors.is_empty() {
-            message(self.window, "清理完成", "已删除所确认的候选项。", 0x40);
+            message(self.window, "清理完成", "已清理所选候选项。可通过“撤销清理”恢复。", 0x40);
         } else {
             message(self.window, "部分候选项未删除", &errors.join("\n"), 0x30);
         }
@@ -1911,6 +2492,10 @@ impl AppState {
             let mut error = None;
             for entry in entries {
                 let command = store_uninstall_command(&entry.package);
+                if let Err(cause) = log_operation("启动商店应用卸载", &entry.name, &command) {
+                    error = Some(format!("{}：{cause}", entry.name));
+                    break;
+                }
                 let result = powershell().and_then(|path| Command::new(path)
                     .args(["-NoProfile", "-NonInteractive", "-Command", &command])
                     .creation_flags(0x08000000).status().map_err(|cause| cause.to_string()))
@@ -1919,6 +2504,12 @@ impl AppState {
                         Err(format!("{}：PowerShell 退出代码 {:?}", entry.name, status.code()))
                     });
                 if let Err(cause) = result {
+                    let _ = log_operation("商店应用卸载失败", &entry.name, &cause);
+                    error = Some(cause);
+                    break;
+                }
+                if let Err(cause) = log_operation("商店应用卸载完成", &entry.name, "卸载命令执行成功") {
+                    completed.push(entry);
                     error = Some(cause);
                     break;
                 }
@@ -1952,15 +2543,24 @@ impl AppState {
             Ok(file) => file,
             Err(error) => { message(self.window, "无法启动卸载程序", &error, 0x10); return false; }
         };
+        if let Err(error) = log_operation("启动桌面应用卸载", &entry.name, &command) {
+            message(self.window, "无法记录卸载操作", &error, 0x10);
+            return false;
+        }
         if let Err(error) = wait_for_desktop_uninstall(self.window, entry, file, args) {
+            let _ = log_operation("桌面应用卸载失败", &entry.name, &error);
             message(self.window, "卸载未完成", &error, 0x30);
             self.refresh();
             return false;
         }
         if open_key(hive(entry.machine), &path, entry.view, KEY_READ).is_some() {
+            let _ = log_operation("桌面应用卸载未确认", &entry.name, "卸载登记项仍然存在");
             message(self.window, "卸载未确认完成", "卸载登记项仍然存在，未执行残留删除。", 0x30);
             self.refresh();
             return false;
+        }
+        if let Err(error) = log_operation("桌面应用卸载完成", &entry.name, "卸载登记项已消失") {
+            message(self.window, "操作记录未保存", &error, 0x30);
         }
         self.scan_and_remove(entry, false);
         true
@@ -2041,6 +2641,8 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
                 (ID_SEARCH, 0x100) => (*pointer).search_focus(true),
                 (ID_SEARCH, 0x200) => (*pointer).search_focus(false),
                 (ID_REFRESH, 0) => (*pointer).refresh(),
+                (ID_HISTORY, 0) => (*pointer).open_history(),
+                (ID_UNDO, 0) => (*pointer).undo_last(),
                 (ID_THEME, 0) => (*pointer).toggle_theme(),
                 (ID_DESKTOP_TAB, 0) | (ID_STORE_TAB, 0) => {
                     (*pointer).store_view = id == ID_STORE_TAB;
@@ -2075,6 +2677,14 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
                 state.refresh();
                 if let Some(error) = error { message(window, "卸载未完成", &error, 0x30); }
             }
+            return 0;
+        }
+        WM_CLOSE if !pointer.is_null() => {
+            if (*pointer).deleting || (*pointer).uninstalling {
+                message(window, "操作进行中", "请等待当前卸载或清理完成后再关闭。", 0x30);
+                return 0;
+            }
+            if (*pointer).confirm_close() { DestroyWindow(window); }
             return 0;
         }
         WM_DESTROY => { PostQuitMessage(0); return 0; }
