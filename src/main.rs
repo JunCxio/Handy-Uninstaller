@@ -698,12 +698,12 @@ fn install_folder(entry: &Entry) -> Option<String> {
     Some(folder.to_string_lossy().into_owned())
 }
 
-fn registry_display_path(entry: &Entry) -> String {
+fn registry_display_path(entry: &Entry, computer_name: &str) -> String {
     let root = if entry.machine { "HKEY_LOCAL_MACHINE" } else { "HKEY_CURRENT_USER" };
     let path = if entry.machine && entry.view == VIEW_32 {
         UNINSTALL_KEY.replacen("SOFTWARE\\", "SOFTWARE\\Wow6432Node\\", 1)
     } else { UNINSTALL_KEY.into() };
-    format!("Computer\\{root}\\{path}\\{}", entry.subkey)
+    format!("{computer_name}\\{root}\\{path}\\{}", entry.subkey)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1376,9 +1376,10 @@ mod tests {
             assert!(ensure_no_reparse_points(&root).is_err());
             std::fs::remove_dir(&link).unwrap();
         }
-        assert!(registry_display_path(&entry).contains("HKEY_CURRENT_USER"));
+        assert!(registry_display_path(&entry, "计算机").starts_with("计算机\\HKEY_CURRENT_USER\\"));
         let x86 = Entry { machine: true, view: VIEW_32, ..entry.clone() };
-        assert!(registry_display_path(&x86).contains("SOFTWARE\\Wow6432Node\\"));
+        assert_eq!(registry_display_path(&x86, "计算机"),
+            "计算机\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\demo");
         let candidates = removal_candidates(&entry, &[entry.clone()]);
         assert!(matches!(candidates.last(), Some(RemovalTarget::Registry { parent, name, .. })
             if parent == UNINSTALL_KEY && name == "demo"));
@@ -2233,13 +2234,15 @@ impl AppState {
         let mut handle = 0;
         let status = unsafe { RegCreateKeyExW(hive(false),
             wide("Software\\Microsoft\\Windows\\CurrentVersion\\Applets\\Regedit").as_ptr(),
-            0, null_mut(), 0, KEY_WRITE, null(), &mut handle, null_mut()) };
+            0, null_mut(), 0, KEY_READ | KEY_WRITE, null(), &mut handle, null_mut()) };
         if status != 0 {
             message(self.window, "无法打开注册表编辑器", &format!("注册表错误代码：{status}"), 0x10);
             return;
         }
         let key = Key(handle);
-        let last_key = wide(&registry_display_path(entry));
+        let previous = text_value(key.0, "LastKey");
+        let computer_name = previous.split('\\').next().filter(|name| !name.is_empty()).unwrap_or("Computer");
+        let last_key = wide(&registry_display_path(entry, computer_name));
         let status = unsafe { RegSetValueExW(key.0, wide("LastKey").as_ptr(), 0, REG_SZ,
             last_key.as_ptr() as *const u8, (last_key.len() * 2) as u32) };
         if status != 0 {
