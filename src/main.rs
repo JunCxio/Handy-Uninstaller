@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use std::collections::HashSet;
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -168,6 +169,7 @@ extern "system" {
     fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     fn FreeLibrary(module: Handle) -> i32;
     fn GetLocalTime(time: *mut LocalTime);
+    fn GetCurrentThreadId() -> u32;
     fn MoveFileW(existing: *const u16, destination: *const u16) -> i32;
 }
 #[link(name = "user32")]
@@ -200,6 +202,13 @@ extern "system" {
     fn EnableWindow(window: Hwnd, enable: i32) -> i32;
     fn SetWindowTextW(window: Hwnd, text: *const u16) -> i32;
     fn MessageBoxW(window: Hwnd, text: *const u16, title: *const u16, flags: u32) -> i32;
+    fn SetWindowsHookExW(kind: i32, proc: Option<unsafe extern "system" fn(i32, usize, isize) -> isize>,
+        module: Handle, thread_id: u32) -> Handle;
+    fn UnhookWindowsHookEx(hook: Handle) -> i32;
+    fn CallNextHookEx(hook: Handle, code: i32, wparam: usize, lparam: isize) -> isize;
+    fn GetWindow(window: Hwnd, command: u32) -> Hwnd;
+    fn SetWindowPos(window: Hwnd, after: Hwnd, x: i32, y: i32,
+        width: i32, height: i32, flags: u32) -> i32;
     fn CreatePopupMenu() -> Handle;
     fn AppendMenuW(menu: Handle, flags: u32, item: usize, text: *const u16) -> i32;
     fn TrackPopupMenu(menu: Handle, flags: u32, x: i32, y: i32, reserved: i32,
@@ -1307,6 +1316,11 @@ fn removal_candidates(entry: &Entry, entries: &[Entry]) -> Vec<RemovalTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn message_position() {
+        assert_eq!(centered_position(
+            Rect { left: 100, top: 50, right: 1300, bottom: 850 },
+            Rect { left: 0, top: 0, right: 400, bottom: 200 }), (500, 350));
+    }
     #[test] fn inventory_filter() {
         assert!(include("普通应用", "uninstall.exe", false, ""));
         assert!(!include("系统组件", "uninstall.exe", true, ""));
@@ -1477,8 +1491,43 @@ mod tests {
     }
 }
 
+thread_local! { static MESSAGE_OWNER: Cell<Hwnd> = const { Cell::new(0) }; }
+
+fn centered_position(owner: Rect, dialog: Rect) -> (i32, i32) {
+    (owner.left + (owner.right - owner.left - (dialog.right - dialog.left)) / 2,
+        owner.top + (owner.bottom - owner.top - (dialog.bottom - dialog.top)) / 2)
+}
+
+unsafe extern "system" fn center_message_box(code: i32, wparam: usize, lparam: isize) -> isize {
+    if code == 5 {
+        MESSAGE_OWNER.with(|owner| {
+            let owner = owner.get();
+            let dialog = wparam as Hwnd;
+            if owner != 0 && GetWindow(dialog, 4) == owner {
+                let mut parent: Rect = zeroed();
+                let mut box_rect: Rect = zeroed();
+                if GetWindowRect(owner, &mut parent) != 0 && GetWindowRect(dialog, &mut box_rect) != 0 {
+                    let (x, y) = centered_position(parent, box_rect);
+                    SetWindowPos(dialog, 0, x, y, 0, 0, 0x15);
+                }
+            }
+        });
+    }
+    CallNextHookEx(0, code, wparam, lparam)
+}
+
 fn message(window: Hwnd, title: &str, text: &str, flags: u32) -> i32 {
-    unsafe { MessageBoxW(window, wide(text).as_ptr(), wide(title).as_ptr(), flags) }
+    MESSAGE_OWNER.with(|owner| {
+        let previous = owner.replace(window);
+        let result = unsafe {
+            let hook = SetWindowsHookExW(5, Some(center_message_box), 0, GetCurrentThreadId());
+            let result = MessageBoxW(window, wide(text).as_ptr(), wide(title).as_ptr(), flags);
+            if hook != 0 { UnhookWindowsHookEx(hook); }
+            result
+        };
+        owner.set(previous);
+        result
+    })
 }
 
 struct RemovalDialog {
@@ -2560,7 +2609,7 @@ impl AppState {
         }
         match running_install_process(entry) {
             Ok(Some(pid)) => {
-                let detail = format!("安装目录中仍有进程运行（PID {pid}）。请从应用界面或托盘退出，再重新卸载。关闭应用前继续卸载可能留下仍在运行的程序文件。");
+                let detail = format!("应用仍在运行（PID {pid}），本次尚未开始卸载。请从应用界面或托盘选择“退出”，再右键重新卸载。直接关闭窗口可能只会将应用隐藏到托盘。");
                 let _ = log_operation("桌面应用卸载已阻止", &entry.name, &detail);
                 message(self.window, "应用仍在运行", &detail, 0x30);
                 return false;
