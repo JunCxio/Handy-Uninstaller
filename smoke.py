@@ -31,6 +31,8 @@ user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.GetMenuItemCount.argtypes = [ctypes.c_void_p]
 user32.GetMenuStringW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_uint]
+user32.IsWindowEnabled.argtypes = [ctypes.c_void_p]
+user32.IsWindowEnabled.restype = ctypes.c_bool
 
 
 class Rect(ctypes.Structure):
@@ -123,17 +125,17 @@ try:
     store_tab = user32.FindWindowExW(window, None, "Button", "商店应用")
     theme = user32.FindWindowExW(window, None, "Button", "深色模式") or user32.FindWindowExW(
         window, None, "Button", "浅色模式")
-    monitor = user32.FindWindowExW(window, None, "Button", "开始安装监控")
     refresh = user32.FindWindowExW(window, None, "Button", "刷新")
-    assert listing and search and desktop_tab and store_tab and theme and monitor and refresh, "列表或操作按钮缺失"
+    assert listing and search and desktop_tab and store_tab and theme and refresh, "列表或操作按钮缺失"
+    assert not user32.FindWindowExW(window, None, "Button", "开始安装监控"), "安装监控按钮仍存在"
     positions = []
-    for control in (monitor, theme, refresh):
+    for control in (theme, refresh):
         position = Rect()
         assert user32.GetWindowRect(control, ctypes.byref(position))
         positions.append(position)
-    assert positions[0].left < positions[1].left < positions[2].left, "操作按钮顺序不符"
-    assert positions[1].right - positions[1].left == 40, "主题按钮不是图标尺寸"
-    assert positions[2].right - positions[2].left == 40, "刷新按钮不是图标尺寸"
+    assert positions[0].left < positions[1].left, "操作按钮顺序不符"
+    assert positions[0].right - positions[0].left == 40, "主题按钮不是图标尺寸"
+    assert positions[1].right - positions[1].left == 40, "刷新按钮不是图标尺寸"
     assert not user32.FindWindowExW(window, None, "Button", "卸载所选应用"), "顶部卸载按钮仍存在"
     for _ in range(300):
         count = user32.SendMessageW(listing, 0x1004, 0, 0)
@@ -158,13 +160,14 @@ try:
             status = child
             break
     assert status, "状态栏缺失"
-    user32.SendMessageW(monitor, 0x00F5, 0, 0)
-    monitor_text = ctypes.create_unicode_buffer(100)
-    user32.GetWindowTextW(monitor, monitor_text, len(monitor_text))
-    assert monitor_text.value == "停止安装监控", "安装监控未启动"
-    user32.SendMessageW(monitor, 0x00F5, 0, 0)
-    user32.GetWindowTextW(monitor, monitor_text, len(monitor_text))
-    assert monitor_text.value == "开始安装监控", "安装监控未停止"
+    user32.SendMessageW(refresh, 0x00F5, 0, 0)
+    assert not user32.IsWindowEnabled(refresh), "刷新时按钮未禁用"
+    for _ in range(300):
+        if user32.IsWindowEnabled(refresh):
+            break
+        time.sleep(0.1)
+    assert user32.IsWindowEnabled(refresh), "刷新未完成"
+    assert user32.SendMessageW(listing, 0x1004, 0, 0) == count, "刷新后列表数量不符"
     client = Rect()
     assert user32.GetClientRect(listing, ctypes.byref(client))
     columns_width = sum(user32.SendMessageW(listing, 0x101D, column, 0) for column in range(5))
@@ -234,7 +237,7 @@ try:
     save_window(window, Path(__file__).with_name("preview-compact.png"))
     if len(sys.argv) > 2:
         time.sleep(float(sys.argv[2]))
-    print(f"窗口正常，桌面应用 {count} 项；页签、搜索和右键菜单通过；未执行卸载或删除。")
+    print(f"窗口正常，桌面应用 {count} 项；页签、搜索、刷新和右键菜单通过；未执行卸载或删除。")
 finally:
     if window:
         user32.PostMessageW(window, 0x0010, 0, 0)

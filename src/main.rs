@@ -9,8 +9,6 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,8 +54,7 @@ const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_SETFONT: u32 = 0x0030;
 const WM_APP_LOADED: u32 = 0x8001;
 const WM_APP_UNINSTALLED: u32 = 0x8002;
-const WM_APP_MONITOR: u32 = 0x8003;
-const WM_APP_DESKTOP_DONE: u32 = 0x8004;
+const WM_APP_DESKTOP_DONE: u32 = 0x8003;
 const LVM_FIRST: u32 = 0x1000;
 const LVM_SETBKCOLOR: u32 = LVM_FIRST + 1;
 const LVM_SETIMAGELIST: u32 = LVM_FIRST + 3;
@@ -77,11 +74,10 @@ const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
 const LVN_ITEMCHANGED: i32 = -101;
 const ID_SEARCH: usize = 101;
 const ID_REFRESH: usize = 102;
-const ID_MONITOR: usize = 103;
-const ID_DESKTOP_TAB: usize = 104;
-const ID_STORE_TAB: usize = 105;
-const ID_THEME: usize = 106;
-const ID_LIST: usize = 107;
+const ID_DESKTOP_TAB: usize = 103;
+const ID_STORE_TAB: usize = 104;
+const ID_THEME: usize = 105;
+const ID_LIST: usize = 106;
 const MENU_UNINSTALL: u32 = 201;
 const MENU_FORCE_REMOVE: u32 = 202;
 const MENU_REMOVE_ENTRY: u32 = 203;
@@ -1203,7 +1199,7 @@ fn icon_for(entry: &Entry, gdiplus: Option<&GdiPlus>) -> Handle {
 }
 
 struct AppState {
-    window: Hwnd, search: Hwnd, refresh: Hwnd, monitor: Hwnd, theme: Hwnd,
+    window: Hwnd, search: Hwnd, refresh: Hwnd, theme: Hwnd,
     desktop_tab: Hwnd, store_tab: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
     title_font: Handle, body_font: Handle, small_font: Handle, bold_font: Handle, stat_font: Handle,
     icon_font: Handle,
@@ -1211,16 +1207,12 @@ struct AppState {
     dark: bool, store_view: bool, search_placeholder: bool,
     entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
     deleting: bool, uninstalling: bool, sort_column: usize, sort_descending: bool,
-    monitor_stop: Option<Arc<AtomicBool>>, monitor_pending: bool,
 }
-
-type MonitorUpdate = (Arc<AtomicBool>, Vec<Entry>, Vec<String>, Vec<String>);
 
 impl AppState {
     fn new(window: Hwnd, instance: Handle) -> Self {
         let basic = WS_CHILD | WS_VISIBLE;
         let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL, 0, ID_SEARCH);
-        let monitor = create_control(instance, window, "BUTTON", "开始安装监控", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_MONITOR);
         let theme = create_control(instance, window, "BUTTON", "", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_THEME);
         let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_REFRESH);
         let desktop_tab = create_control(instance, window, "BUTTON", "桌面应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_DESKTOP_TAB);
@@ -1241,7 +1233,7 @@ impl AppState {
         let icon_font = unsafe { CreateFontW(-19, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
             wide("Segoe MDL2 Assets").as_ptr()) };
         for (control, font) in [(status, small_font), (search, body_font), (refresh, body_font),
-            (monitor, body_font), (theme, body_font), (desktop_tab, bold_font),
+            (theme, body_font), (desktop_tab, bold_font),
             (store_tab, bold_font), (list, body_font)] {
             unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1); }
         }
@@ -1256,15 +1248,14 @@ impl AppState {
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
         let dark = saved_dark_mode();
         let colors = palette(dark);
-        let state = Self { window, search, refresh, monitor, theme, desktop_tab, store_tab, list, status, images,
+        let state = Self { window, search, refresh, theme, desktop_tab, store_tab, list, status, images,
             title_font, body_font, small_font, bold_font, stat_font, icon_font,
             edit_brush: unsafe { CreateSolidBrush(colors.input) },
             inactive_brush: unsafe { CreateSolidBrush(colors.inactive_input) },
             status_brush: unsafe { CreateSolidBrush(colors.chrome) }, dark, store_view: false,
             search_placeholder: true,
             entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false,
-            deleting: false, uninstalling: false, sort_column: 0, sort_descending: false,
-            monitor_stop: None, monitor_pending: false };
+            deleting: false, uninstalling: false, sort_column: 0, sort_descending: false };
         set_title_dark(window, dark);
         for control in [search, list] { set_control_theme(control, dark); }
         state.color_list();
@@ -1280,7 +1271,6 @@ impl AppState {
         let height = rect.bottom.max(540);
         unsafe {
             MoveWindow(self.search, 72, 133, 338, 22, 1);
-            MoveWindow(self.monitor, width - 280, 124, 144, 40, 1);
             MoveWindow(self.theme, width - 124, 124, 40, 40, 1);
             MoveWindow(self.refresh, width - 72, 124, 40, 40, 1);
             MoveWindow(self.desktop_tab, 32, 181, 96, 45, 1);
@@ -1342,7 +1332,7 @@ impl AppState {
             self.inactive_brush = CreateSolidBrush(colors.inactive_input);
             self.status_brush = CreateSolidBrush(colors.chrome);
             SetWindowTextW(self.theme, wide(if self.dark { "浅色模式" } else { "深色模式" }).as_ptr());
-            for control in [self.window, self.search, self.monitor, self.refresh,
+            for control in [self.window, self.search, self.refresh,
                 self.theme, self.desktop_tab, self.store_tab, self.list, self.status] {
                 InvalidateRect(control, null(), 1);
             }
@@ -1443,17 +1433,11 @@ impl AppState {
             }
             return;
         }
-        let primary = id == ID_MONITOR;
         fill(item.dc, item.rect, colors.background);
-        let background = if primary && disabled { colors.badge }
-            else if primary { if pressed { color(13, 88, 180) } else { color(25, 112, 218) } }
-            else if pressed { colors.selected } else { colors.background };
+        let background = if pressed { colors.selected } else { colors.background };
         rounded(item.dc, Rect { left: item.rect.left + 1, top: item.rect.top + 1,
-            right: item.rect.right - 1, bottom: item.rect.bottom - 1 }, background,
-            if primary && disabled { colors.inactive_line }
-            else if primary { background } else { colors.line }, 10);
-        let ink = if disabled { colors.inactive_text }
-            else if primary { color(255, 255, 255) } else { colors.text };
+            right: item.rect.right - 1, bottom: item.rect.bottom - 1 }, background, colors.line, 10);
+        let ink = if disabled { colors.inactive_text } else { colors.text };
         if id == ID_THEME || id == ID_REFRESH {
             let symbol = if id == ID_REFRESH { "\u{E895}" }
                 else if self.dark { "\u{E706}" } else { "\u{E708}" };
@@ -1536,7 +1520,6 @@ impl AppState {
 
     fn refresh(&mut self) {
         if self.loading { return; }
-        self.monitor_pending = false;
         self.loading = true;
         self.sync_controls();
         self.set_status("正在读取应用列表…");
@@ -1547,44 +1530,6 @@ impl AppState {
                 unsafe { drop(Box::from_raw(result)); }
             }
         });
-    }
-
-    fn toggle_monitor(&mut self) {
-        if let Some(stop) = self.monitor_stop.take() {
-            stop.store(true, Ordering::Relaxed);
-            unsafe { SetWindowTextW(self.monitor, wide("开始安装监控").as_ptr()); }
-            self.set_status("安装监控已停止");
-            return;
-        }
-        if self.loading { return; }
-        let stop = Arc::new(AtomicBool::new(false));
-        let token = stop.clone();
-        let window = self.window;
-        let mut known: HashSet<_> = self.entries.iter().map(entry_identity).collect();
-        thread::spawn(move || {
-            while !token.load(Ordering::Relaxed) {
-                for _ in 0..50 {
-                    if token.load(Ordering::Relaxed) { return; }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                let (entries, errors) = inventory();
-                if token.load(Ordering::Relaxed) { return; }
-                let current: HashSet<_> = entries.iter().map(entry_identity).collect();
-                if current != known {
-                    let added: Vec<String> = entries.iter().filter(|entry| !known.contains(&entry_identity(entry)))
-                        .map(|entry| entry.name.clone()).collect();
-                    let update: *mut MonitorUpdate = Box::into_raw(Box::new((token.clone(), entries, errors, added)));
-                    if unsafe { PostMessageW(window, WM_APP_MONITOR, 0, update as isize) } == 0 {
-                        unsafe { drop(Box::from_raw(update)); }
-                        return;
-                    }
-                }
-                known = current;
-            }
-        });
-        self.monitor_stop = Some(stop);
-        unsafe { SetWindowTextW(self.monitor, wide("停止安装监控").as_ptr()); }
-        self.set_status("安装监控中：每 5 秒检查新登记的应用；关闭窗口后停止。");
     }
 
     fn loaded(&mut self, mut entries: Vec<Entry>, errors: Vec<String>) {
@@ -1617,7 +1562,6 @@ impl AppState {
             }
         }
         if !errors.is_empty() { message(self.window, "部分来源读取失败", &errors.join("\n"), 0x30); }
-        if self.monitor_pending && !self.deleting && !self.uninstalling { self.refresh(); }
     }
 
     fn selected(&self) -> Option<usize> {
@@ -1628,7 +1572,7 @@ impl AppState {
     fn sync_controls(&self) {
         let enabled = i32::from(!self.deleting && !self.uninstalling && !self.loading);
         for control in [self.list, self.search, self.desktop_tab, self.store_tab,
-            self.refresh, self.monitor] {
+            self.refresh] {
             unsafe { EnableWindow(control, enabled); }
         }
         unsafe { InvalidateRect(self.window, null(), 0); InvalidateRect(self.list, null(), 0); }
@@ -1697,7 +1641,6 @@ impl AppState {
                     }
                     self.deleting = false;
                     self.sync_controls();
-                    if self.monitor_pending && !self.uninstalling { self.refresh(); }
                 }
                 MENU_REGISTRY => self.open_registry(),
                 MENU_FOLDER => self.open_folder(),
@@ -1922,8 +1865,7 @@ impl AppState {
         let column = ["应用名称", "版本", "发布者", "来源", "安装时间"][self.sort_column];
         let direction = if self.sort_descending { "降序" } else { "升序" };
         let busy = if self.uninstalling { "；卸载进行中，不能删除其他应用" } else { "" };
-        let monitoring = if self.monitor_stop.is_some() { "；安装监控中" } else { "" };
-        self.set_status(&format!("已显示 {} 个{kind}；按{column}{direction}排列{busy}{monitoring}", self.visible.len()));
+        self.set_status(&format!("已显示 {} 个{kind}；按{column}{direction}排列{busy}", self.visible.len()));
     }
 
     fn uninstall_selected(&mut self) {
@@ -2043,7 +1985,6 @@ fn store_family_absent(family: &str) -> bool {
 
 impl Drop for AppState {
     fn drop(&mut self) {
-        if let Some(stop) = &self.monitor_stop { stop.store(true, Ordering::Relaxed); }
         unsafe {
             if self.images != 0 { ImageList_Destroy(self.images); }
             for object in [self.title_font, self.body_font, self.small_font,
@@ -2100,7 +2041,6 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
                 (ID_SEARCH, 0x100) => (*pointer).search_focus(true),
                 (ID_SEARCH, 0x200) => (*pointer).search_focus(false),
                 (ID_REFRESH, 0) => (*pointer).refresh(),
-                (ID_MONITOR, 0) => (*pointer).toggle_monitor(),
                 (ID_THEME, 0) => (*pointer).toggle_theme(),
                 (ID_DESKTOP_TAB, 0) | (ID_STORE_TAB, 0) => {
                     (*pointer).store_view = id == ID_STORE_TAB;
@@ -2134,24 +2074,6 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
                 state.deleting = false;
                 state.refresh();
                 if let Some(error) = error { message(window, "卸载未完成", &error, 0x30); }
-            }
-            return 0;
-        }
-        WM_APP_MONITOR => {
-            let (token, entries, errors, added) = *Box::from_raw(lparam as *mut MonitorUpdate);
-            if !pointer.is_null() {
-                let state = &mut *pointer;
-                if state.monitor_stop.as_ref().is_some_and(|active| Arc::ptr_eq(active, &token)) {
-                    if state.deleting || state.uninstalling || state.loading {
-                        state.monitor_pending = true;
-                    } else {
-                        state.loaded(entries, errors);
-                        if !added.is_empty() {
-                            state.set_status(&format!("安装监控：发现 {} 个新应用，包括“{}”。",
-                                added.len(), added[0]));
-                        }
-                    }
-                }
             }
             return 0;
         }
