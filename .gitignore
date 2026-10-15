@@ -1,3 +1,4 @@
 /target/
 /preview.png
+/preview-*.png
 __pycache__/

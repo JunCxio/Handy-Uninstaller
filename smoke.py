@@ -25,6 +25,8 @@ user32.SendMessageW.restype = ctypes.c_ssize_t
 user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+user32.MoveWindow.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_int]
 user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.GetMenuItemCount.argtypes = [ctypes.c_void_p]
 user32.GetMenuStringW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_uint]
@@ -116,10 +118,11 @@ try:
     assert window, "窗口未出现"
     listing = user32.FindWindowExW(window, None, "SysListView32", None)
     search = user32.FindWindowExW(window, None, "Edit", None)
-    tabs = user32.FindWindowExW(window, None, "SysTabControl32", None)
-    assert listing and search and tabs, "列表、搜索框或页签缺失"
-    assert user32.SendMessageW(tabs, 0x1304, 0, 0) == 2, "应用页签数量不符"
-    assert user32.SendMessageW(tabs, 0x130B, 0, 0) == 0, "默认视图不是桌面应用"
+    desktop_tab = user32.FindWindowExW(window, None, "Button", "桌面应用")
+    store_tab = user32.FindWindowExW(window, None, "Button", "商店应用")
+    theme = user32.FindWindowExW(window, None, "Button", "深色模式") or user32.FindWindowExW(
+        window, None, "Button", "浅色模式")
+    assert listing and search and desktop_tab and store_tab and theme, "列表、搜索框、页签或主题按钮缺失"
     assert not user32.FindWindowExW(window, None, "Button", "卸载所选应用"), "顶部卸载按钮仍存在"
     for _ in range(300):
         count = user32.SendMessageW(listing, 0x1004, 0, 0)
@@ -127,6 +130,11 @@ try:
             break
         time.sleep(0.1)
     assert count > 0, "应用列表为空"
+    user32.SendMessageW(store_tab, 0x00F5, 0, 0)
+    if user32.SendMessageW(listing, 0x1004, 0, 0) > 0:
+        save_window(window, Path(__file__).with_name("preview-store.png"))
+    user32.SendMessageW(desktop_tab, 0x00F5, 0, 0)
+    assert user32.SendMessageW(listing, 0x1004, 0, 0) == count, "切回桌面应用后列表不符"
     status = None
     child = None
     while True:
@@ -148,20 +156,36 @@ try:
     user32.SendMessageW(monitor, 0x00F5, 0, 0)
     user32.GetWindowTextW(monitor, monitor_text, len(monitor_text))
     assert monitor_text.value == "开始安装监控", "安装监控未停止"
-    header = user32.SendMessageW(listing, 0x101F, 0, 0)
-    assert header and user32.SendMessageW(header, 0x1200, 0, 0) == 5, "安装时间列缺失"
     client = Rect()
     assert user32.GetClientRect(listing, ctypes.byref(client))
     columns_width = sum(user32.SendMessageW(listing, 0x101D, column, 0) for column in range(5))
     assert abs(columns_width - client.right) <= 3, "末列未填满列表"
-    user32.SendMessageW(header, 0x0201, 1, 10 | (10 << 16))
-    user32.SendMessageW(header, 0x0202, 0, 10 | (10 << 16))
+    user32.SendMessageW(window, 0x0201, 1, 50 | (243 << 16))
     status_text = ctypes.create_unicode_buffer(200)
     user32.GetWindowTextW(status, status_text, len(status_text))
     assert "应用名称降序" in status_text.value, "点击列标题没有切换排序"
     images = user32.SendMessageW(listing, 0x1002, 1, 0)
     assert images, "图标列表未建立"
-    save_window(window, Path(__file__).with_name("preview.png"))
+    selected_row = min(8, count - 1)
+    row_point = 100 | ((selected_row * 43 + 20) << 16)
+    user32.PostMessageW(listing, 0x0201, 1, row_point)
+    user32.PostMessageW(listing, 0x0202, 0, row_point)
+    time.sleep(0.1)
+    assert user32.SendMessageW(listing, 0x100C, -1, 2) == selected_row, "列表选中状态不符"
+    theme_text = ctypes.create_unicode_buffer(100)
+    user32.GetWindowTextW(theme, theme_text, len(theme_text))
+    initial_theme = theme_text.value
+    save_window(window, Path(__file__).with_name(
+        "preview-dark.png" if initial_theme == "浅色模式" else "preview.png"))
+    user32.SendMessageW(theme, 0x00F5, 0, 0)
+    user32.GetWindowTextW(theme, theme_text, len(theme_text))
+    assert theme_text.value != initial_theme, "主题切换失败"
+    user32.SendMessageW(desktop_tab, 0x00F5, 0, 0)
+    save_window(window, Path(__file__).with_name(
+        "preview-dark.png" if initial_theme == "深色模式" else "preview.png"))
+    user32.SendMessageW(theme, 0x00F5, 0, 0)
+    user32.SendMessageW(search, 0x0201, 1, 10 | (10 << 16))
+    user32.SendMessageW(search, 0x0202, 0, 10 | (10 << 16))
     for character in "7-Zip":
         user32.SendMessageW(search, 0x0102, ord(character), 0)
     time.sleep(0.1)
@@ -194,6 +218,11 @@ try:
                ("卸载", "强制删除", "删除条目", "注册表条目", "安装文件夹")), labels
     assert not any("谷歌" in label for label in labels), labels
     user32.PostMessageW(menu_window, 0x0100, 27, 0)
+    time.sleep(0.1)
+    window_rect = Rect()
+    assert user32.GetWindowRect(window, ctypes.byref(window_rect))
+    assert user32.MoveWindow(window, window_rect.left, window_rect.top, 900, 620, 1)
+    save_window(window, Path(__file__).with_name("preview-compact.png"))
     if len(sys.argv) > 2:
         time.sleep(float(sys.argv[2]))
     print(f"窗口正常，桌面应用 {count} 项；页签、搜索和右键菜单通过；未执行卸载或删除。")

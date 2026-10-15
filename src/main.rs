@@ -31,42 +31,54 @@ const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
 const WS_TABSTOP: u32 = 0x00010000;
 const WS_OVERLAPPEDWINDOW: u32 = 0x00cf0000;
-const WS_EX_CLIENTEDGE: u32 = 0x00000200;
 const LVS_REPORT: u32 = 1;
 const LVS_SHOWSELALWAYS: u32 = 8;
+const LVS_OWNERDRAWFIXED: u32 = 0x400;
+const LVS_NOCOLUMNHEADER: u32 = 0x4000;
+const BS_OWNERDRAW: u32 = 0x000b;
 const ES_AUTOHSCROLL: u32 = 0x0080;
+const WM_PAINT: u32 = 0x000f;
+const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SIZE: u32 = 5;
 const WM_DESTROY: u32 = 2;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_COMMAND: u32 = 0x0111;
 const WM_NOTIFY: u32 = 0x004e;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
+const WM_CTLCOLOREDIT: u32 = 0x0133;
 const WM_CONTEXTMENU: u32 = 0x007b;
+const WM_MEASUREITEM: u32 = 0x002c;
+const WM_DRAWITEM: u32 = 0x002b;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_SETFONT: u32 = 0x0030;
 const WM_APP_LOADED: u32 = 0x8001;
 const WM_APP_UNINSTALLED: u32 = 0x8002;
 const WM_APP_MONITOR: u32 = 0x8003;
-const TCM_GETCURSEL: u32 = 0x130b;
-const TCM_INSERTITEMW: u32 = 0x133e;
-const TCN_SELCHANGE: i32 = -551;
 const LVM_FIRST: u32 = 0x1000;
+const LVM_SETBKCOLOR: u32 = LVM_FIRST + 1;
 const LVM_SETIMAGELIST: u32 = LVM_FIRST + 3;
 const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
 const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
 const LVM_HITTEST: u32 = LVM_FIRST + 18;
 const LVM_GETCOLUMNWIDTH: u32 = LVM_FIRST + 29;
 const LVM_SETCOLUMNWIDTH: u32 = LVM_FIRST + 30;
+const LVM_SETTEXTCOLOR: u32 = LVM_FIRST + 36;
+const LVM_SETTEXTBKCOLOR: u32 = LVM_FIRST + 38;
 const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43;
 const LVM_GETITEMSTATE: u32 = LVM_FIRST + 44;
 const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
 const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
 const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
-const LVN_COLUMNCLICK: i32 = -108;
+const LVN_ITEMCHANGED: i32 = -101;
 const ID_SEARCH: usize = 101;
 const ID_REFRESH: usize = 102;
 const ID_MONITOR: usize = 103;
-const ID_TABS: usize = 104;
+const ID_DESKTOP_TAB: usize = 104;
+const ID_STORE_TAB: usize = 105;
+const ID_THEME: usize = 106;
+const ID_LIST: usize = 107;
 const MENU_UNINSTALL: u32 = 201;
 const MENU_FORCE_REMOVE: u32 = 202;
 const MENU_REMOVE_ENTRY: u32 = 203;
@@ -78,7 +90,18 @@ const MENU_BATCH_UNINSTALL: u32 = 206;
 #[derive(Clone, Copy)]
 struct Point { x: i32, y: i32 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
+#[repr(C)]
+struct PaintStruct { dc: Handle, erase: i32, rect: Rect, restore: i32, update: i32, reserved: [u8; 32] }
+#[repr(C)]
+struct MeasureItem { kind: u32, id: u32, item: u32, width: u32, height: u32, data: usize }
+#[repr(C)]
+struct DrawItem { kind: u32, id: u32, item: u32, action: u32, state: u32,
+    window: Hwnd, dc: Handle, rect: Rect, data: usize }
+#[repr(C)]
+struct MinMaxInfo { reserved: Point, max_size: Point, max_position: Point,
+    min_track: Point, max_track: Point }
 #[repr(C)]
 struct Msg { hwnd: Hwnd, message: u32, wparam: usize, lparam: isize, time: u32, point: Point, private: u32 }
 #[repr(C)]
@@ -108,14 +131,7 @@ struct LvItem {
     group_id: i32, columns: u32, column_ptr: *mut u32, column_format: *mut i32, group: i32,
 }
 #[repr(C)]
-struct TabItem {
-    mask: u32, state: u32, state_mask: u32, text: *mut u16,
-    text_max: i32, image: i32, param: isize,
-}
-#[repr(C)]
 struct NmHdr { hwnd: Hwnd, id: usize, code: i32 }
-#[repr(C)]
-struct NmListView { header: NmHdr, item: i32, subitem: i32 }
 #[repr(C)]
 struct LvHitTest { point: Point, flags: u32, item: i32, subitem: i32, group: i32 }
 
@@ -161,6 +177,12 @@ extern "system" {
     fn GetWindowLongPtrW(window: Hwnd, index: i32) -> isize;
     fn GetClientRect(window: Hwnd, rect: *mut Rect) -> i32;
     fn MoveWindow(window: Hwnd, x: i32, y: i32, width: i32, height: i32, repaint: i32) -> i32;
+    fn BeginPaint(window: Hwnd, paint: *mut PaintStruct) -> Handle;
+    fn EndPaint(window: Hwnd, paint: *const PaintStruct) -> i32;
+    fn InvalidateRect(window: Hwnd, rect: *const Rect, erase: i32) -> i32;
+    fn SetFocus(window: Hwnd) -> Hwnd;
+    fn FillRect(dc: Handle, rect: *const Rect, brush: Handle) -> i32;
+    fn DrawTextW(dc: Handle, text: *const u16, length: i32, rect: *mut Rect, flags: u32) -> i32;
     fn EnableWindow(window: Hwnd, enable: i32) -> i32;
     fn SetWindowTextW(window: Hwnd, text: *const u16) -> i32;
     fn MessageBoxW(window: Hwnd, text: *const u16, title: *const u16, flags: u32) -> i32;
@@ -185,6 +207,14 @@ extern "system" {
     fn DeleteObject(object: Handle) -> i32;
     fn SetTextColor(dc: Handle, color: u32) -> u32;
     fn SetBkColor(dc: Handle, color: u32) -> u32;
+    fn SetBkMode(dc: Handle, mode: i32) -> i32;
+    fn SelectObject(dc: Handle, object: Handle) -> Handle;
+    fn CreatePen(style: i32, width: i32, color: u32) -> Handle;
+    fn RoundRect(dc: Handle, left: i32, top: i32, right: i32, bottom: i32,
+        ellipse_width: i32, ellipse_height: i32) -> i32;
+    fn Ellipse(dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> i32;
+    fn MoveToEx(dc: Handle, x: i32, y: i32, previous: *mut Point) -> i32;
+    fn LineTo(dc: Handle, x: i32, y: i32) -> i32;
 }
 #[link(name = "comctl32")]
 extern "system" {
@@ -193,6 +223,7 @@ extern "system" {
     fn ImageList_ReplaceIcon(list: Handle, index: i32, icon: Handle) -> i32;
     fn ImageList_Remove(list: Handle, index: i32) -> i32;
     fn ImageList_Destroy(list: Handle) -> i32;
+    fn ImageList_Draw(list: Handle, index: i32, dc: Handle, x: i32, y: i32, style: u32) -> i32;
 }
 #[link(name = "shell32")]
 extern "system" {
@@ -249,6 +280,103 @@ impl Drop for GdiPlus {
 fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() }
 fn color(red: u8, green: u8, blue: u8) -> u32 {
     red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
+}
+#[derive(Clone, Copy)]
+struct Palette { background: u32, chrome: u32, text: u32, muted: u32, line: u32,
+    accent: u32, selected: u32, input: u32, badge: u32 }
+
+fn palette(dark: bool) -> Palette {
+    if dark {
+        Palette { background: color(15, 23, 36), chrome: color(18, 30, 46),
+            text: color(230, 240, 251), muted: color(148, 169, 193),
+            line: color(42, 59, 80), accent: color(105, 172, 255),
+            selected: color(30, 54, 84), input: color(25, 39, 57), badge: color(35, 53, 75) }
+    } else {
+        Palette { background: color(255, 255, 255), chrome: color(248, 250, 253),
+            text: color(24, 45, 72), muted: color(104, 128, 158),
+            line: color(228, 235, 244), accent: color(22, 111, 217),
+            selected: color(234, 244, 255), input: color(255, 255, 255),
+            badge: color(242, 246, 251) }
+    }
+}
+
+fn fill(dc: Handle, rect: Rect, shade: u32) {
+    unsafe {
+        let brush = CreateSolidBrush(shade);
+        FillRect(dc, &rect, brush);
+        DeleteObject(brush);
+    }
+}
+
+fn rounded(dc: Handle, rect: Rect, background: u32, border: u32, radius: i32) {
+    unsafe {
+        let brush = CreateSolidBrush(background);
+        let pen = CreatePen(0, 1, border);
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, pen);
+        RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+    }
+}
+
+fn draw_text(dc: Handle, text: &str, mut rect: Rect, font: Handle, shade: u32, flags: u32) {
+    unsafe {
+        let old = SelectObject(dc, font);
+        SetBkMode(dc, 1);
+        SetTextColor(dc, shade);
+        DrawTextW(dc, wide(text).as_ptr(), -1, &mut rect, flags | 0x800);
+        SelectObject(dc, old);
+    }
+}
+
+fn saved_dark_mode() -> bool {
+    open_key(hive(false), "SOFTWARE\\HandyUninstaller", 0, KEY_READ)
+        .is_some_and(|key| is_one(key.0, "DarkMode"))
+}
+
+fn save_dark_mode(dark: bool) -> Result<(), i32> {
+    let mut handle = 0;
+    let result = unsafe { RegCreateKeyExW(hive(false), wide("SOFTWARE\\HandyUninstaller").as_ptr(),
+        0, null_mut(), 0, KEY_WRITE, null(), &mut handle, null_mut()) };
+    if result != 0 { return Err(result); }
+    let key = Key(handle);
+    let value = u32::from(dark).to_le_bytes();
+    let result = unsafe { RegSetValueExW(key.0, wide("DarkMode").as_ptr(), 0, REG_DWORD,
+        value.as_ptr(), value.len() as u32) };
+    if result == 0 { Ok(()) } else { Err(result) }
+}
+
+fn set_title_dark(window: Hwnd, dark: bool) {
+    let value = i32::from(dark);
+    unsafe {
+        let module = LoadLibraryW(wide("dwmapi.dll").as_ptr());
+        if module == 0 { return; }
+        let address = GetProcAddress(module, b"DwmSetWindowAttribute\0".as_ptr());
+        if !address.is_null() {
+            let set_attribute: unsafe extern "system" fn(Hwnd, u32, *const c_void, u32) -> i32 = transmute(address);
+            if set_attribute(window, 20, &value as *const _ as *const c_void, 4) != 0 {
+                set_attribute(window, 19, &value as *const _ as *const c_void, 4);
+            }
+        }
+        FreeLibrary(module);
+    }
+}
+
+fn set_control_theme(window: Hwnd, dark: bool) {
+    unsafe {
+        let module = LoadLibraryW(wide("uxtheme.dll").as_ptr());
+        if module == 0 { return; }
+        let address = GetProcAddress(module, b"SetWindowTheme\0".as_ptr());
+        if !address.is_null() {
+            let set_theme: unsafe extern "system" fn(Hwnd, *const u16, *const u16) -> i32 = transmute(address);
+            let name = wide("DarkMode_Explorer");
+            set_theme(window, if dark { name.as_ptr() } else { null() }, null());
+        }
+        FreeLibrary(module);
+    }
 }
 fn from_wide(text: &[u16]) -> String {
     String::from_utf16_lossy(&text[..text.iter().position(|&ch| ch == 0).unwrap_or(text.len())])
@@ -385,7 +513,7 @@ fn store_apps(errors: &mut Vec<String>) -> Vec<Entry> {
             (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
         if name.is_empty() || package.is_empty() || fields.next().is_some() { return None; }
         Some(Entry { name: name.into(), version: version.into(), publisher: String::new(),
-            source: "商店应用 · 当前用户".into(), command: String::new(), subkey: String::new(),
+            source: "商店应用".into(), command: String::new(), subkey: String::new(),
             package: package.into(), display_icon: icon.into(), install_location: location.into(),
             install_date: String::new(), machine: false, view: 0, msi: false, image: 0 })
     }).collect()
@@ -719,14 +847,6 @@ fn add_column(list: Hwnd, index: usize, title: &str, width: i32) {
     unsafe { SendMessageW(list, LVM_INSERTCOLUMNW, index, &column as *const _ as isize); }
 }
 
-fn add_tab(tabs: Hwnd, index: usize, title: &str) {
-    let mut text = wide(title);
-    let mut item: TabItem = unsafe { zeroed() };
-    item.mask = 1;
-    item.text = text.as_mut_ptr();
-    unsafe { SendMessageW(tabs, TCM_INSERTITEMW, index, &item as *const _ as isize); }
-}
-
 fn icon_for(entry: &Entry, gdiplus: Option<&GdiPlus>) -> Handle {
     if !entry.package.is_empty() {
         let Some(gdiplus) = gdiplus else { return 0 };
@@ -757,11 +877,10 @@ fn icon_for(entry: &Entry, gdiplus: Option<&GdiPlus>) -> Handle {
 }
 
 struct AppState {
-    window: Hwnd, band: Hwnd, line: Hwnd, title: Hwnd, subtitle: Hwnd,
-    label: Hwnd, search: Hwnd, refresh: Hwnd, monitor: Hwnd, tabs: Hwnd,
-    list: Hwnd, status: Hwnd, images: Handle,
-    title_font: Handle, body_font: Handle, small_font: Handle,
-    band_brush: Handle, line_brush: Handle, surface_brush: Handle,
+    window: Hwnd, search: Hwnd, refresh: Hwnd, monitor: Hwnd, theme: Hwnd,
+    desktop_tab: Hwnd, store_tab: Hwnd, list: Hwnd, status: Hwnd, images: Handle,
+    title_font: Handle, body_font: Handle, small_font: Handle, bold_font: Handle, stat_font: Handle,
+    edit_brush: Handle, status_brush: Handle, dark: bool, store_view: bool, search_placeholder: bool,
     entries: Vec<Entry>, visible: Vec<usize>, loading: bool, rendering: bool,
     deleting: bool, uninstalling: bool, sort_column: usize, sort_descending: bool,
     monitor_stop: Option<Arc<AtomicBool>>, monitor_pending: bool,
@@ -772,48 +891,53 @@ type MonitorUpdate = (Arc<AtomicBool>, Vec<Entry>, Vec<String>, Vec<String>);
 impl AppState {
     fn new(window: Hwnd, instance: Handle) -> Self {
         let basic = WS_CHILD | WS_VISIBLE;
-        let band = create_control(instance, window, "STATIC", "", basic, 0, 0);
-        let line = create_control(instance, window, "STATIC", "", basic, 0, 0);
-        let title = create_control(instance, window, "STATIC", "Handy Uninstaller", basic, 0, 0);
-        let subtitle = create_control(instance, window, "STATIC", "应用管理 · 卸载与残留清理", basic, 0, 0);
-        let label = create_control(instance, window, "STATIC", "搜索应用", basic, 0, 0);
-        let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL,
-            WS_EX_CLIENTEDGE, ID_SEARCH);
-        let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP, 0, ID_REFRESH);
-        let monitor = create_control(instance, window, "BUTTON", "开始安装监控", basic | WS_TABSTOP, 0, ID_MONITOR);
-        let tabs = create_control(instance, window, "SysTabControl32", "", basic | WS_TABSTOP, 0, ID_TABS);
+        let search = create_control(instance, window, "EDIT", "", basic | WS_TABSTOP | ES_AUTOHSCROLL, 0, ID_SEARCH);
+        let refresh = create_control(instance, window, "BUTTON", "刷新", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_REFRESH);
+        let monitor = create_control(instance, window, "BUTTON", "开始安装监控", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_MONITOR);
+        let theme = create_control(instance, window, "BUTTON", "", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_THEME);
+        let desktop_tab = create_control(instance, window, "BUTTON", "桌面应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_DESKTOP_TAB);
+        let store_tab = create_control(instance, window, "BUTTON", "商店应用", basic | WS_TABSTOP | BS_OWNERDRAW, 0, ID_STORE_TAB);
         let list = create_control(instance, window, "SysListView32", "",
-            basic | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE, 0);
+            basic | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_OWNERDRAWFIXED | LVS_NOCOLUMNHEADER, 0, ID_LIST);
         let status = create_control(instance, window, "STATIC", "正在读取应用列表…", basic, 0, 0);
-        let title_font = unsafe { CreateFontW(-27, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0,
+        let title_font = unsafe { CreateFontW(-28, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0,
             wide("Segoe UI").as_ptr()) };
-        let body_font = unsafe { CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+        let body_font = unsafe { CreateFontW(-15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
             wide("Segoe UI").as_ptr()) };
-        let small_font = unsafe { CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+        let small_font = unsafe { CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
             wide("Segoe UI").as_ptr()) };
-        for (control, font) in [(title, title_font), (subtitle, small_font), (status, small_font),
-            (label, body_font), (search, body_font), (refresh, body_font), (monitor, body_font),
-            (tabs, body_font), (list, body_font)] {
+        let bold_font = unsafe { CreateFontW(-15, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0,
+            wide("Segoe UI").as_ptr()) };
+        let stat_font = unsafe { CreateFontW(-26, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0,
+            wide("Segoe UI").as_ptr()) };
+        for (control, font) in [(status, small_font), (search, body_font), (refresh, body_font),
+            (monitor, body_font), (theme, body_font), (desktop_tab, bold_font),
+            (store_tab, bold_font), (list, body_font)] {
             unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1); }
         }
-        add_tab(tabs, 0, "桌面应用");
-        add_tab(tabs, 1, "商店应用");
+        unsafe { SetWindowTextW(search, wide("搜索应用名称或发布者").as_ptr()); }
         unsafe { SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x10020); }
         add_column(list, 0, "应用名称", 350);
         add_column(list, 1, "版本", 115);
         add_column(list, 2, "发布者", 230);
         add_column(list, 3, "来源", 150);
         add_column(list, 4, "安装时间", 120);
-        let images = unsafe { ImageList_Create(16, 16, 0x21, 8, 16) };
+        let images = unsafe { ImageList_Create(20, 20, 0x21, 8, 16) };
         unsafe { SendMessageW(list, LVM_SETIMAGELIST, 1, images); }
-        let state = Self { window, band, line, title, subtitle, label, search, refresh, monitor, tabs, list, status, images,
-            title_font, body_font, small_font,
-            band_brush: unsafe { CreateSolidBrush(color(32, 50, 71)) },
-            line_brush: unsafe { CreateSolidBrush(color(15, 125, 140)) },
-            surface_brush: unsafe { CreateSolidBrush(color(244, 247, 250)) },
+        let dark = saved_dark_mode();
+        let colors = palette(dark);
+        let state = Self { window, search, refresh, monitor, theme, desktop_tab, store_tab, list, status, images,
+            title_font, body_font, small_font, bold_font, stat_font,
+            edit_brush: unsafe { CreateSolidBrush(colors.input) },
+            status_brush: unsafe { CreateSolidBrush(colors.chrome) }, dark, store_view: false,
+            search_placeholder: true,
             entries: Vec::new(), visible: Vec::new(), loading: false, rendering: false,
             deleting: false, uninstalling: false, sort_column: 0, sort_descending: false,
             monitor_stop: None, monitor_pending: false };
+        set_title_dark(window, dark);
+        for control in [search, list] { set_control_theme(control, dark); }
+        state.color_list();
+        unsafe { SetWindowTextW(theme, wide(if dark { "浅色模式" } else { "深色模式" }).as_ptr()); }
         state.layout();
         state
     }
@@ -821,61 +945,246 @@ impl AppState {
     fn layout(&self) {
         let mut rect: Rect = unsafe { zeroed() };
         unsafe { GetClientRect(self.window, &mut rect); }
-        let width = rect.right.max(640);
-        let height = rect.bottom.max(390);
+        let width = rect.right.max(820);
+        let height = rect.bottom.max(540);
         unsafe {
-            MoveWindow(self.band, 0, 0, width, 76, 1);
-            MoveWindow(self.line, 0, 76, width, 3, 1);
-            MoveWindow(self.title, 22, 11, 500, 35, 1);
-            MoveWindow(self.subtitle, 24, 48, 600, 20, 1);
-            MoveWindow(self.label, 22, 96, 68, 25, 1);
-            MoveWindow(self.search, 95, 91, 350, 31, 1);
-            MoveWindow(self.monitor, width - 282, 91, 160, 31, 1);
-            MoveWindow(self.refresh, width - 110, 91, 88, 31, 1);
-            MoveWindow(self.tabs, 22, 138, width - 44, 32, 1);
-            MoveWindow(self.list, 22, 172, width - 44, height - 222, 1);
-            MoveWindow(self.status, 22, height - 39, width - 44, 24, 1);
+            MoveWindow(self.search, 72, 133, 338, 22, 1);
+            MoveWindow(self.theme, width - 374, 124, 103, 40, 1);
+            MoveWindow(self.monitor, width - 260, 124, 144, 40, 1);
+            MoveWindow(self.refresh, width - 105, 124, 73, 40, 1);
+            MoveWindow(self.desktop_tab, 32, 181, 112, 45, 1);
+            MoveWindow(self.store_tab, 148, 181, 112, 45, 1);
+            MoveWindow(self.list, 32, 264, width - 64, height - 334, 1);
+            MoveWindow(self.status, width * 38 / 100, height - 36,
+                width * 62 / 100 - 32, 20, 1);
+            InvalidateRect(self.window, null(), 0);
         }
-        self.fit_last_column();
+        self.fit_columns();
     }
 
-    fn fit_last_column(&self) {
+    fn fit_columns(&self) {
         let mut rect: Rect = unsafe { zeroed() };
         unsafe { GetClientRect(self.list, &mut rect); }
-        let used: i32 = (0..4).map(|column|
-            unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, column, 0) as i32 }).sum();
-        let width = (rect.right - used).max(120);
-        unsafe { SendMessageW(self.list, LVM_SETCOLUMNWIDTH, 4, width as isize); }
+        let width = (rect.right - 2).max(0);
+        let columns = [width * 35 / 100, width * 14 / 100, width * 24 / 100, width * 14 / 100];
+        for (index, column) in columns.iter().enumerate() {
+            unsafe { SendMessageW(self.list, LVM_SETCOLUMNWIDTH, index, *column as isize); }
+        }
+        unsafe { SendMessageW(self.list, LVM_SETCOLUMNWIDTH, 4,
+            (width - columns.iter().sum::<i32>()).max(90) as isize); }
     }
 
     fn static_brush(&self, dc: Handle, control: Hwnd) -> Handle {
+        if control != self.status { return 0; }
+        let colors = palette(self.dark);
+        unsafe { SetBkColor(dc, colors.chrome); SetTextColor(dc, colors.muted); }
+        self.status_brush
+    }
+
+    fn edit_brush(&self, dc: Handle) -> Handle {
+        let colors = palette(self.dark);
+        unsafe { SetBkColor(dc, colors.input);
+            SetTextColor(dc, if self.search_placeholder { colors.muted } else { colors.text }); }
+        self.edit_brush
+    }
+
+    fn color_list(&self) {
+        let colors = palette(self.dark);
         unsafe {
-            if control == self.band || control == self.title || control == self.subtitle {
-                SetBkColor(dc, color(32, 50, 71));
-                SetTextColor(dc, if control == self.subtitle { color(190, 207, 219) }
-                    else { color(255, 255, 255) });
-                self.band_brush
-            } else if control == self.line {
-                self.line_brush
-            } else if control == self.status {
-                SetBkColor(dc, color(244, 247, 250));
-                SetTextColor(dc, color(58, 77, 95));
-                self.surface_brush
-            } else {
-                SetBkColor(dc, color(255, 255, 255));
-                SetTextColor(dc, color(32, 50, 71));
-                GetStockObject(0)
+            SendMessageW(self.list, LVM_SETBKCOLOR, 0, colors.background as isize);
+            SendMessageW(self.list, LVM_SETTEXTBKCOLOR, 0, colors.background as isize);
+            SendMessageW(self.list, LVM_SETTEXTCOLOR, 0, colors.text as isize);
+        }
+    }
+
+    fn toggle_theme(&mut self) {
+        self.dark = !self.dark;
+        let colors = palette(self.dark);
+        unsafe {
+            DeleteObject(self.edit_brush);
+            DeleteObject(self.status_brush);
+            self.edit_brush = CreateSolidBrush(colors.input);
+            self.status_brush = CreateSolidBrush(colors.chrome);
+            SetWindowTextW(self.theme, wide(if self.dark { "浅色模式" } else { "深色模式" }).as_ptr());
+            for control in [self.window, self.search, self.monitor, self.refresh,
+                self.theme, self.desktop_tab, self.store_tab, self.list, self.status] {
+                InvalidateRect(control, null(), 1);
             }
+        }
+        set_title_dark(self.window, self.dark);
+        for control in [self.search, self.list] { set_control_theme(control, self.dark); }
+        self.color_list();
+        if let Err(code) = save_dark_mode(self.dark) {
+            self.set_status(&format!("外观已切换，但无法保存设置（注册表错误代码：{code}）"));
+        }
+    }
+
+    fn paint_shell(&self) {
+        let mut paint: PaintStruct = unsafe { zeroed() };
+        let dc = unsafe { BeginPaint(self.window, &mut paint) };
+        if dc == 0 { return; }
+        let mut client: Rect = unsafe { zeroed() };
+        unsafe { GetClientRect(self.window, &mut client); }
+        let colors = palette(self.dark);
+        let width = client.right;
+        let height = client.bottom;
+        fill(dc, client, colors.background);
+        fill(dc, Rect { left: 0, top: 0, right: width, bottom: 109 }, colors.chrome);
+        fill(dc, Rect { left: 0, top: 108, right: width, bottom: 109 }, colors.line);
+        draw_text(dc, "管理已安装应用", Rect { left: 32, top: 22, right: 440, bottom: 60 },
+            self.title_font, colors.text, 0x20 | 0x4);
+        draw_text(dc, "快速查找、卸载应用并清理残留", Rect { left: 33, top: 66, right: 520, bottom: 87 },
+            self.small_font, colors.muted, 0x20 | 0x4);
+        let total = self.entries.iter().filter(|entry| in_view(&entry.package, self.store_view)).count();
+        draw_text(dc, &total.to_string(), Rect { left: width - 185, top: 30, right: width - 118, bottom: 68 },
+            self.stat_font, colors.accent, 0x20 | 0x4 | 0x2);
+        draw_text(dc, if self.store_view { "个商店应用" } else { "个桌面应用" },
+            Rect { left: width - 112, top: 39, right: width - 31, bottom: 62 },
+            self.small_font, colors.muted, 0x20 | 0x4);
+        rounded(dc, Rect { left: 32, top: 124, right: 424, bottom: 164 },
+            colors.input, colors.line, 10);
+        unsafe {
+            let pen = CreatePen(0, 2, colors.muted);
+            let old_pen = SelectObject(dc, pen);
+            let old_brush = SelectObject(dc, GetStockObject(5));
+            Ellipse(dc, 51, 138, 61, 148);
+            MoveToEx(dc, 60, 147, null_mut());
+            LineTo(dc, 66, 153);
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+        fill(dc, Rect { left: 32, top: 225, right: width - 32, bottom: 226 }, colors.line);
+        let mut start = 32;
+        for (index, label) in ["应用名称", "版本", "发布者", "来源", "安装时间"].iter().enumerate() {
+            let column_width = unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, index, 0) as i32 };
+            draw_text(dc, label, Rect { left: start + 16, top: 231, right: start + column_width - 8, bottom: 259 },
+                self.small_font, colors.muted, 0x20 | 0x4 | 0x8000);
+            start += column_width;
+        }
+        fill(dc, Rect { left: 32, top: 263, right: width - 32, bottom: 264 }, colors.line);
+        fill(dc, Rect { left: 0, top: height - 70, right: width, bottom: height }, colors.chrome);
+        fill(dc, Rect { left: 0, top: height - 70, right: width, bottom: height - 69 }, colors.line);
+        if let Some(index) = self.selected() {
+            let entry = &self.entries[index];
+            unsafe { ImageList_Draw(self.images, entry.image, dc, 34, height - 46, 1); }
+            draw_text(dc, &entry.name, Rect { left: 78, top: height - 62,
+                right: width * 38 / 100 - 16, bottom: height - 38 },
+                self.bold_font, colors.text, 0x20 | 0x4 | 0x8000);
+            draw_text(dc, &format!("已选中应用 · 版本 {}", if entry.version.is_empty() { "未知" } else { &entry.version }),
+                Rect { left: 78, top: height - 38, right: width * 38 / 100 - 16,
+                    bottom: height - 18 }, self.small_font, colors.muted, 0x20 | 0x4 | 0x8000);
+        } else {
+            draw_text(dc, "选择应用后右键查看操作", Rect { left: 78, top: height - 62,
+                right: width * 38 / 100 - 16, bottom: height - 38 },
+                self.bold_font, colors.text, 0x20 | 0x4 | 0x8000);
+        }
+        unsafe { EndPaint(self.window, &paint); }
+    }
+
+    fn draw_button(&self, item: &DrawItem) {
+        let colors = palette(self.dark);
+        let pressed = item.state & 1 != 0;
+        let disabled = item.state & 4 != 0;
+        let id = item.id as usize;
+        if id == ID_DESKTOP_TAB || id == ID_STORE_TAB {
+            let active = (id == ID_STORE_TAB) == self.store_view;
+            fill(item.dc, item.rect, colors.background);
+            let count = self.entries.iter().filter(|entry|
+                in_view(&entry.package, id == ID_STORE_TAB)).count();
+            let label = format!("{}  {count}", if id == ID_STORE_TAB { "商店应用" } else { "桌面应用" });
+            draw_text(item.dc, &label, item.rect, self.bold_font,
+                if active { colors.accent } else { colors.muted }, 0x20 | 0x4 | 0x1);
+            if active {
+                fill(item.dc, Rect { left: item.rect.left, top: item.rect.bottom - 3,
+                    right: item.rect.right, bottom: item.rect.bottom }, colors.accent);
+            }
+            return;
+        }
+        let primary = id == ID_MONITOR;
+        fill(item.dc, item.rect, colors.background);
+        let background = if primary { if pressed { color(13, 88, 180) } else { color(25, 112, 218) } }
+            else if pressed { colors.selected } else { colors.background };
+        rounded(item.dc, Rect { left: item.rect.left + 1, top: item.rect.top + 1,
+            right: item.rect.right - 1, bottom: item.rect.bottom - 1 }, background,
+            if primary { background } else { colors.line }, 10);
+        draw_text(item.dc, &window_text(item.window), item.rect, self.bold_font,
+            if disabled { colors.muted } else if primary { color(255, 255, 255) } else { colors.text },
+            0x20 | 0x4 | 0x1);
+    }
+
+    fn draw_row(&self, item: &DrawItem) {
+        let Some(&index) = self.visible.get(item.item as usize) else { return; };
+        let entry = &self.entries[index];
+        let colors = palette(self.dark);
+        let selected = item.state & 1 != 0;
+        fill(item.dc, item.rect, if selected { colors.selected } else { colors.background });
+        fill(item.dc, Rect { left: item.rect.left, top: item.rect.bottom - 1,
+            right: item.rect.right, bottom: item.rect.bottom }, colors.line);
+        unsafe { ImageList_Draw(self.images, entry.image, item.dc,
+            item.rect.left + 16, item.rect.top + (item.rect.bottom - item.rect.top - 20) / 2, 1); }
+        let widths: [i32; 5] = std::array::from_fn(|column|
+            unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, column, 0) as i32 });
+        draw_text(item.dc, &entry.name, Rect { left: item.rect.left + 52, top: item.rect.top,
+            right: item.rect.left + widths[0] - 12, bottom: item.rect.bottom - 1 },
+            self.bold_font, colors.text, 0x20 | 0x4 | 0x8000);
+        let mut start = item.rect.left + widths[0];
+        for (column, value) in [&entry.version, &entry.publisher, &entry.source,
+            &entry.install_date].iter().enumerate() {
+            let right = start + widths[column + 1];
+            if column == 2 {
+                let badge_width = if entry.package.is_empty() { 110 } else { 150 };
+                let badge = Rect { left: start + 10, top: item.rect.top + 9,
+                    right: (start + 10 + badge_width).min(right - 8), bottom: item.rect.bottom - 9 };
+                rounded(item.dc, badge, colors.badge, colors.badge, 8);
+                draw_text(item.dc, value, Rect { left: badge.left + 7, top: badge.top,
+                    right: badge.right - 4, bottom: badge.bottom }, self.small_font,
+                    colors.muted, 0x20 | 0x4 | 0x8000);
+            } else {
+                draw_text(item.dc, if column == 3 && value.is_empty() { "—" } else { value },
+                    Rect { left: start + 16, top: item.rect.top, right: right - 8,
+                        bottom: item.rect.bottom - 1 }, self.body_font, colors.text,
+                    0x20 | 0x4 | 0x8000);
+            }
+            start = right;
         }
     }
 
     fn set_status(&self, text: &str) { unsafe { SetWindowTextW(self.status, wide(text).as_ptr()); } }
 
+    fn search_focus(&mut self, focused: bool) {
+        if focused && self.search_placeholder {
+            self.search_placeholder = false;
+            unsafe { SetWindowTextW(self.search, wide("").as_ptr()); }
+        } else if !focused && window_text(self.search).is_empty() {
+            self.search_placeholder = true;
+            unsafe { SetWindowTextW(self.search, wide("搜索应用名称或发布者").as_ptr()); }
+        }
+        unsafe { InvalidateRect(self.search, null(), 1); }
+    }
+
+    fn sort_at(&mut self, x: i32, y: i32) {
+        let mut client: Rect = unsafe { zeroed() };
+        unsafe { GetClientRect(self.window, &mut client); }
+        if x < 32 || x >= client.right - 32 || !(226..264).contains(&y) { return; }
+        let mut edge = 32;
+        for column in 0..5 {
+            edge += unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, column, 0) as i32 };
+            if x < edge {
+                self.sort_descending = self.sort_column == column && !self.sort_descending;
+                self.sort_column = column;
+                self.render();
+                return;
+            }
+        }
+    }
+
     fn refresh(&mut self) {
         if self.loading { return; }
         self.monitor_pending = false;
         self.loading = true;
-        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.monitor, 0); EnableWindow(self.tabs, 0); }
+        unsafe { EnableWindow(self.refresh, 0); EnableWindow(self.monitor, 0);
+            EnableWindow(self.desktop_tab, 0); EnableWindow(self.store_tab, 0); }
         self.set_status("正在读取应用列表…");
         let window = self.window;
         thread::spawn(move || {
@@ -942,7 +1251,8 @@ impl AppState {
         self.entries = entries;
         self.visible.clear();
         self.loading = false;
-        unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.monitor, 1); EnableWindow(self.tabs, 1); }
+        unsafe { EnableWindow(self.refresh, 1); EnableWindow(self.monitor, 1);
+            EnableWindow(self.desktop_tab, 1); EnableWindow(self.store_tab, 1); }
         self.rendering = false;
         self.render();
         for (row, &index) in self.visible.iter().enumerate() {
@@ -1175,8 +1485,9 @@ impl AppState {
     fn render(&mut self) {
         self.rendering = true;
         let selected = self.selected_indices();
-        let store_view = unsafe { SendMessageW(self.tabs, TCM_GETCURSEL, 0, 0) == 1 };
-        let query = window_text(self.search).trim().to_lowercase();
+        let store_view = self.store_view;
+        let query = if self.search_placeholder { String::new() }
+            else { window_text(self.search).trim().to_lowercase() };
         unsafe { SendMessageW(self.list, LVM_DELETEALLITEMS, 0, 0); }
         self.visible = self.entries.iter().enumerate().filter(|(_, entry)| {
             in_view(&entry.package, store_view) && (query.is_empty()
@@ -1211,8 +1522,13 @@ impl AppState {
             state.state_mask = 3;
             unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, row, &state as *const _ as isize); }
         }
-        self.fit_last_column();
+        self.fit_columns();
         self.rendering = false;
+        unsafe {
+            for control in [self.window, self.desktop_tab, self.store_tab, self.list] {
+                InvalidateRect(control, null(), 0);
+            }
+        }
         let kind = if store_view { "商店应用" } else { "桌面应用" };
         let column = ["应用名称", "版本", "发布者", "来源", "安装时间"][self.sort_column];
         let direction = if self.sort_descending { "降序" } else { "升序" };
@@ -1326,7 +1642,7 @@ impl Drop for AppState {
         unsafe {
             if self.images != 0 { ImageList_Destroy(self.images); }
             for object in [self.title_font, self.body_font, self.small_font,
-                self.band_brush, self.line_brush, self.surface_brush] {
+                self.bold_font, self.stat_font, self.edit_brush, self.status_brush] {
                 if object != 0 { DeleteObject(object); }
             }
         }
@@ -1336,9 +1652,33 @@ impl Drop for AppState {
 unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usize, lparam: isize) -> isize {
     let pointer = GetWindowLongPtrW(window, -21) as *mut AppState;
     match message_id {
+        WM_GETMINMAXINFO if lparam != 0 => {
+            (*(lparam as *mut MinMaxInfo)).min_track = Point { x: 860, y: 600 };
+            return 0;
+        }
         WM_SIZE if !pointer.is_null() => { (*pointer).layout(); return 0; }
+        WM_ERASEBKGND if !pointer.is_null() => return 1,
+        WM_PAINT if !pointer.is_null() => { (*pointer).paint_shell(); return 0; }
         WM_CTLCOLORSTATIC if !pointer.is_null() => {
-            return (*pointer).static_brush(wparam as Handle, lparam as Hwnd);
+            let brush = (*pointer).static_brush(wparam as Handle, lparam as Hwnd);
+            if brush != 0 { return brush; }
+        }
+        WM_CTLCOLOREDIT if !pointer.is_null() => return (*pointer).edit_brush(wparam as Handle),
+        WM_MEASUREITEM if wparam == ID_LIST && lparam != 0 => {
+            (*(lparam as *mut MeasureItem)).height = 43;
+            return 1;
+        }
+        WM_DRAWITEM if !pointer.is_null() && lparam != 0 => {
+            let item = &*(lparam as *const DrawItem);
+            if item.window == (*pointer).list { (*pointer).draw_row(item); }
+            else { (*pointer).draw_button(item); }
+            return 1;
+        }
+        WM_LBUTTONDOWN if !pointer.is_null() => {
+            let x = lparam as u32 as u16 as i16 as i32;
+            let y = ((lparam as u32 >> 16) as u16 as i16) as i32;
+            (*pointer).sort_at(x, y);
+            return 0;
         }
         WM_CONTEXTMENU if !pointer.is_null() && wparam as Hwnd == (*pointer).list => {
             let point = Point { x: (lparam as u32 as u16 as i16) as i32,
@@ -1351,8 +1691,15 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
             let notification = (wparam >> 16) & 0xffff;
             match (id, notification) {
                 (ID_SEARCH, 0x300) => (*pointer).render(),
+                (ID_SEARCH, 0x100) => (*pointer).search_focus(true),
+                (ID_SEARCH, 0x200) => (*pointer).search_focus(false),
                 (ID_REFRESH, 0) => (*pointer).refresh(),
                 (ID_MONITOR, 0) => (*pointer).toggle_monitor(),
+                (ID_THEME, 0) => (*pointer).toggle_theme(),
+                (ID_DESKTOP_TAB, 0) | (ID_STORE_TAB, 0) => {
+                    (*pointer).store_view = id == ID_STORE_TAB;
+                    (*pointer).render();
+                }
                 _ => return DefWindowProcW(window, message_id, wparam, lparam),
             }
             return 0;
@@ -1360,16 +1707,8 @@ unsafe extern "system" fn window_proc(window: Hwnd, message_id: u32, wparam: usi
         WM_NOTIFY if !pointer.is_null() => {
             if lparam != 0 && !(*pointer).rendering {
                 let header = &*(lparam as *const NmHdr);
-                if header.hwnd == (*pointer).tabs && header.code == TCN_SELCHANGE {
-                    (*pointer).render();
-                } else if header.hwnd == (*pointer).list && header.code == LVN_COLUMNCLICK {
-                    let column = (*(lparam as *const NmListView)).subitem as usize;
-                    if column <= 4 {
-                        let state = &mut *pointer;
-                        state.sort_descending = state.sort_column == column && !state.sort_descending;
-                        state.sort_column = column;
-                        state.render();
-                    }
+                if header.hwnd == (*pointer).list && header.code == LVN_ITEMCHANGED {
+                    InvalidateRect(window, null(), 0);
                 }
             }
             return 0;
@@ -1427,12 +1766,13 @@ fn main() {
             menu_name: null(), class_name: class_name.as_ptr() };
         if RegisterClassW(&class) == 0 { return; }
         let window = CreateWindowExW(0, class_name.as_ptr(), wide("Handy Uninstaller").as_ptr(),
-            WS_OVERLAPPEDWINDOW, 100, 100, 1120, 700, 0, 0, instance, null_mut());
+            WS_OVERLAPPEDWINDOW | 0x02000000, 100, 100, 1200, 760, 0, 0, instance, null_mut());
         if window == 0 { return; }
         let state = Box::into_raw(Box::new(AppState::new(window, instance)));
         SetWindowLongPtrW(window, -21, state as isize);
         ShowWindow(window, 5);
         UpdateWindow(window);
+        SetFocus((*state).list);
         (*state).refresh();
         let mut msg: Msg = zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
