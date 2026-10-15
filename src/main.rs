@@ -1093,6 +1093,7 @@ impl AppState {
         if id == ID_DESKTOP_TAB || id == ID_STORE_TAB {
             let active = (id == ID_STORE_TAB) == self.store_view;
             fill(item.dc, item.rect, colors.background);
+            fill(item.dc, Rect { top: item.rect.bottom - 1, ..item.rect }, colors.line);
             let label = if id == ID_STORE_TAB { "商店应用" } else { "桌面应用" };
             draw_text(item.dc, label, Rect { right: item.rect.left + 66, ..item.rect },
                 self.small_font, if active { colors.accent } else { colors.muted }, 0x20 | 0x4);
