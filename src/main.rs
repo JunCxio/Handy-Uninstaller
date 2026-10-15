@@ -1181,8 +1181,16 @@ fn safe_directory(path: &Path, entry: &Entry, entries: &[Entry]) -> Option<PathB
     if !path.is_dir() || path.components().count() < 3 { return None; }
     let leaf = path.file_name()?.to_string_lossy();
     if ["Microsoft", "Windows", "WindowsApps", "System32", "Common Files"]
-        .iter().any(|name| leaf.eq_ignore_ascii_case(name))
-        || (!entry.publisher.is_empty() && leaf.eq_ignore_ascii_case(&entry.publisher)) { return None; }
+        .iter().any(|name| leaf.eq_ignore_ascii_case(name)) { return None; }
+    if !entry.publisher.is_empty() && leaf.eq_ignore_ascii_case(&entry.publisher) {
+        let location = expand_env(entry.install_location.trim().trim_matches('"'));
+        let registered_folder = Path::new(&location).canonicalize().ok();
+        let uninstaller_folder = split_command(&entry.command).ok()
+            .and_then(|(file, _)| PathBuf::from(file).parent()?.canonicalize().ok());
+        if registered_folder.as_ref() != Some(&path) || uninstaller_folder.as_ref() != Some(&path) {
+            return None;
+        }
+    }
     for variable in ["WINDIR", "SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles",
         "CommonProgramFiles(x86)", "ProgramData", "PUBLIC", "USERPROFILE", "APPDATA",
         "LOCALAPPDATA", "TEMP", "TMP"] {
@@ -1354,6 +1362,12 @@ mod tests {
             install_location: folder.to_string_lossy().into_owned(), install_date: String::new(), machine: false, view: VIEW_64,
             msi: false, image: 0 };
         assert!(safe_directory(&folder, &entry, &[entry.clone()]).is_some());
+        let publisher_folder = Entry { publisher: "Demo".into(),
+            command: format!("\"{}\"", folder.join("unins000.exe").display()), ..entry.clone() };
+        assert!(safe_directory(&folder, &publisher_folder, &[publisher_folder.clone()]).is_some());
+        let unrelated_uninstaller = Entry { command: root.join("uninstall.exe").to_string_lossy().into_owned(),
+            ..publisher_folder.clone() };
+        assert!(safe_directory(&folder, &unrelated_uninstaller, &[unrelated_uninstaller.clone()]).is_none());
         let other = Entry { subkey: "other".into(), ..entry.clone() };
         assert!(safe_directory(&folder, &entry, &[entry.clone(), other]).is_none());
         let parent_owner = Entry { subkey: "parent".into(), install_location: root.to_string_lossy().into_owned(), ..entry.clone() };
