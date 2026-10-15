@@ -54,6 +54,8 @@ const LVM_SETIMAGELIST: u32 = LVM_FIRST + 3;
 const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
 const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
 const LVM_HITTEST: u32 = LVM_FIRST + 18;
+const LVM_GETCOLUMNWIDTH: u32 = LVM_FIRST + 29;
+const LVM_SETCOLUMNWIDTH: u32 = LVM_FIRST + 30;
 const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43;
 const LVM_GETITEMSTATE: u32 = LVM_FIRST + 44;
 const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
@@ -834,6 +836,16 @@ impl AppState {
             MoveWindow(self.list, 22, 172, width - 44, height - 222, 1);
             MoveWindow(self.status, 22, height - 39, width - 44, 24, 1);
         }
+        self.fit_last_column();
+    }
+
+    fn fit_last_column(&self) {
+        let mut rect: Rect = unsafe { zeroed() };
+        unsafe { GetClientRect(self.list, &mut rect); }
+        let used: i32 = (0..4).map(|column|
+            unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, column, 0) as i32 }).sum();
+        let width = (rect.right - used).max(120);
+        unsafe { SendMessageW(self.list, LVM_SETCOLUMNWIDTH, 4, width as isize); }
     }
 
     fn static_brush(&self, dc: Handle, control: Hwnd) -> Handle {
@@ -1199,6 +1211,7 @@ impl AppState {
             state.state_mask = 3;
             unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, row, &state as *const _ as isize); }
         }
+        self.fit_last_column();
         self.rendering = false;
         let kind = if store_view { "商店应用" } else { "桌面应用" };
         let column = ["应用名称", "版本", "发布者", "来源", "安装时间"][self.sort_column];

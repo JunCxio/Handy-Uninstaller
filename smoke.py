@@ -35,6 +35,9 @@ class Rect(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(Rect)]
+
+
 class BitmapInfoHeader(ctypes.Structure):
     _fields_ = [("size", ctypes.c_uint32), ("width", ctypes.c_int32),
                 ("height", ctypes.c_int32), ("planes", ctypes.c_uint16),
@@ -147,6 +150,10 @@ try:
     assert monitor_text.value == "开始安装监控", "安装监控未停止"
     header = user32.SendMessageW(listing, 0x101F, 0, 0)
     assert header and user32.SendMessageW(header, 0x1200, 0, 0) == 5, "安装时间列缺失"
+    client = Rect()
+    assert user32.GetClientRect(listing, ctypes.byref(client))
+    columns_width = sum(user32.SendMessageW(listing, 0x101D, column, 0) for column in range(5))
+    assert abs(columns_width - client.right) <= 3, "末列未填满列表"
     user32.SendMessageW(header, 0x0201, 1, 10 | (10 << 16))
     user32.SendMessageW(header, 0x0202, 0, 10 | (10 << 16))
     status_text = ctypes.create_unicode_buffer(200)
