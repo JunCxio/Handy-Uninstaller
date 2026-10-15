@@ -2241,6 +2241,7 @@ impl AppState {
         }
         let key = Key(handle);
         let previous = text_value(key.0, "LastKey");
+        // shortcut: 从未打开过注册表编辑器的非英语系统缺少根节点名称；需要读取本地化资源才能覆盖此情况。
         let computer_name = previous.split('\\').next().filter(|name| !name.is_empty()).unwrap_or("Computer");
         let last_key = wide(&registry_display_path(entry, computer_name));
         let status = unsafe { RegSetValueExW(key.0, wide("LastKey").as_ptr(), 0, REG_SZ,
